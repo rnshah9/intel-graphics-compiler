@@ -1,0 +1,5 @@
+project: rnshah9/intel-graphics-compiler
+target: intel-graphics-compiler
+
+cmds:
+  - cmd: /repo/IGC/BiFModule/linux/linux_resource_linker @@ out a
