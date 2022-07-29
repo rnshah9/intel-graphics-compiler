@@ -2,4 +2,4 @@ project: intel-graphics-compiler
 target: linux-resource-linker
 
 cmds:
-  - cmd: /repo/IGC/BiFModule/linux/linux_resource_linker @@ out a
+  - cmd: /linux_resource_linker @@ out a
