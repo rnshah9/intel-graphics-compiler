@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2018-2021 Intel Corporation
+Copyright (C) 2018-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -30,11 +30,13 @@ SPDX-License-Identifier: MIT
 #include "llvm/GenXIntrinsics/GenXIntrinsics.h"
 #include "llvm/GenXIntrinsics/GenXSimdCFLowering.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include <algorithm>
 #include <set>
@@ -308,7 +310,8 @@ Function *GenXPacketize::vectorizeSIMTFunction(Function *F, unsigned Width) {
                        VecFName + Suffix[Width / 8], F->getParent());
   ClonedFunc->setCallingConv(F->getCallingConv());
   ClonedFunc->setAttributes(F->getAttributes());
-  ClonedFunc->setAlignment(IGCLLVM::getAlign(*F));
+  if (F->getAlignment() > 0)
+    ClonedFunc->setAlignment(IGCLLVM::getAlign(*F));
 
   // then use CloneFunctionInto
   ValueToValueMapTy ArgMap;
@@ -324,8 +327,9 @@ Function *GenXPacketize::vectorizeSIMTFunction(Function *F, unsigned Width) {
   }
   SmallVector<ReturnInst *, 10> returns;
   ClonedCodeInfo CloneInfo;
-  IGCLLVM::CloneFunctionInto(ClonedFunc, F, ArgMap, true, returns, Suffix[Width / 8],
-                    &CloneInfo);
+  IGCLLVM::CloneFunctionInto(ClonedFunc, F, ArgMap,
+      IGCLLVM::CloneFunctionChangeType::GlobalChanges,
+      returns, Suffix[Width / 8], &CloneInfo);
 
   ReplaceMap.clear();
   // find uniform instructions related to uniform arguments
@@ -818,7 +822,7 @@ Value *GenXPacketize::packetizeLLVMIntrinsic(Instruction *pInst) {
   // packetize intrinsic operands
   std::vector<Type *> vectorArgTys;
   std::vector<Value *> packetizedArgs;
-  for (auto &operand : pCall->arg_operands()) {
+  for (auto &operand : IGCLLVM::args(pCall)) {
     auto VV = getPacketizeValue(operand.get());
     packetizedArgs.push_back(VV);
     vectorArgTys.push_back(VV->getType());
@@ -1002,7 +1006,7 @@ Value *GenXPacketize::packetizeLLVMInstruction(Instruction *pInst) {
     auto ElemType = pInst->getType();
     auto VecDstTy = IGCLLVM::FixedVectorType::get(ElemType, B->mVWidth);
     // create an read-region
-    CMRegion R(VecDstTy);
+    vc::CMRegion R(VecDstTy);
     if (ConstantInt *CI = dyn_cast<ConstantInt>(Idx)) {
       R.Offset = CI->getSExtValue() * ElemType->getPrimitiveSizeInBits() / 8;
       R.Indirect = nullptr;
@@ -1037,7 +1041,7 @@ Value *GenXPacketize::packetizeLLVMInstruction(Instruction *pInst) {
         cast<IGCLLVM::FixedVectorType>(OldVec->getType())->getNumElements();
     auto ElemType = pInst->getOperand(1)->getType();
     // create an write-region
-    CMRegion R(Vec->getType());
+    vc::CMRegion R(Vec->getType());
     if (ConstantInt *CI = dyn_cast<ConstantInt>(Idx)) {
       // special case, this is really just like a bitcast
       if (CI->getZExtValue() == 0 && N == 1 && isa<UndefValue>(OldVec)) {
@@ -1170,7 +1174,12 @@ Value *GenXPacketize::packetizeLLVMInstruction(Instruction *pInst) {
     // for the rest of the instructions includingi phi, vectorize
     // the instruction type as well as its args
     Type *vecType = B->GetVectorType(pInst->getType());
+
+    // Set vectorized dbg value to undef, since currently it's not
+    // salvageble
+    llvm::replaceDbgUsesWithUndef(pInst);
     pInst->mutateType(vecType);
+
     for (Use &op : pInst->operands()) {
       auto v = getPacketizeValue(op.get());
       if (v)
@@ -1528,7 +1537,7 @@ Value *GenXPacketize::packetizeGenXIntrinsic(Instruction *inst) {
         // packetize intrinsic operands
         const DebugLoc &DL = CI->getDebugLoc();
         auto OrigV0 = CI->getOperand(0);
-        CMRegion R(CI);
+        vc::CMRegion R(CI);
         IGC_ASSERT(R.Width == 1);
         if (cast<IGCLLVM::FixedVectorType>(OrigV0->getType())
                 ->getNumElements() == 1) {
@@ -1547,7 +1556,7 @@ Value *GenXPacketize::packetizeGenXIntrinsic(Instruction *inst) {
       case GenXIntrinsic::genx_wrregioni: {
         auto NewV0 = CI->getOperand(1);
         const DebugLoc &DL = CI->getDebugLoc();
-        CMRegion R(CI);
+        vc::CMRegion R(CI);
         IGC_ASSERT(isa<IGCLLVM::FixedVectorType>(NewV0->getType()));
         IGC_ASSERT(cast<IGCLLVM::FixedVectorType>(NewV0->getType())
                        ->getNumElements() == 1);
@@ -1704,6 +1713,20 @@ Value *GenXPacketize::packetizeInstruction(Instruction *pInst) {
     if (pInst->getName() != "") {
       pResult->setName(pInst->getName());
     }
+    // When the resulting instruction has the same type
+    // Debug values can be preserved
+    if (pResult->getType() == pInst->getType()) {
+      SmallVector<DbgVariableIntrinsic *, 1> DbgUsers;
+      llvm::findDbgUsers(DbgUsers, pInst);
+      for (auto *DII : DbgUsers) {
+#if LLVM_VERSION_MAJOR >= 13
+        DII->replaceVariableLocationOp(pInst, pResult);
+#else
+        DII->setOperand(0, llvm::MetadataAsValue::get(DII->getContext(),
+                                                      llvm::ValueAsMetadata::get(pResult)));
+#endif
+      }
+    }
 
     // Copy any metadata to new instruction
     if (pResult != pInst && isa<Instruction>(pResult)) {
@@ -1810,7 +1833,7 @@ void GenXPacketize::fixupLLVMIntrinsics(Function &F) {
 GlobalVariable *GenXPacketize::findGlobalExecMask() {
   // look for the global EMask variable if exists
   for (auto &Global : M->getGlobalList()) {
-    auto Ty = Global.getType()->getElementType();
+    auto Ty = Global.getType()->getPointerElementType();
     if (Ty->isVectorTy() &&
         cast<IGCLLVM::FixedVectorType>(Ty)->getNumElements() ==
             CMSimdCFLower::MAX_SIMD_CF_WIDTH) {

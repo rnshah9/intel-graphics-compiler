@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2019-2021 Intel Corporation
+Copyright (C) 2019-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -523,6 +523,9 @@ class GenXKernelBuilder {
   // GRF width in unit of byte
   unsigned GrfByteSize = defaultGRFByteSize;
 
+  // Default stackcall execution size
+  VISA_Exec_Size StackCallExecSize = EXEC_SIZE_16;
+
   // Line in code, filename and dir for emit loc/file in visa
   unsigned LastEmittedVisaLine = 0;
   StringRef LastFilename = "";
@@ -544,7 +547,15 @@ class GenXKernelBuilder {
   // control mask before exiting from the subroutine.
   uint32_t DefaultFloatControl = 0;
 
-  static const uint32_t CR_Mask = 0x1 << 10 | 0x3 << 6 | 0x3 << 4 | 0x1;
+  enum CRBits {
+    SinglePrecisionMode = 1,
+    RoundingMode = 3 << 4,
+    DoublePrecisionDenorm = 1 << 6,
+    SinglePrecisionDenorm = 1 << 7,
+    HalfPrecisionDenorm = 1 << 10,
+  };
+
+  uint32_t CRMask = 0;
 
   // normally false, set to true if there is any SIMD CF in the func or this is
   // (indirectly) called inside any SIMD CF.
@@ -1156,8 +1167,14 @@ bool GenXKernelBuilder::run() {
   GrfByteSize = Subtarget ? Subtarget->getGRFByteSize() : defaultGRFByteSize;
   StackSurf = Subtarget ? Subtarget->stackSurface() : PREDEFINED_SURFACE_STACK;
 
+  CRMask = CRBits::SinglePrecisionMode | CRBits::RoundingMode |
+           CRBits::DoublePrecisionDenorm | CRBits::SinglePrecisionDenorm |
+           CRBits::HalfPrecisionDenorm;
+
   UseNewStackBuilder =
       BackendConfig->useNewStackBuilder() && Subtarget->isOCLRuntime();
+  StackCallExecSize =
+      getExecSizeFromValue(BackendConfig->getInteropSubgroupSize());
 
   IGC_ASSERT(Subtarget);
 
@@ -1381,10 +1398,10 @@ void GenXKernelBuilder::buildInstructions() {
           .getAsInteger(0, FloatControl);
 
       // Clear current float control bits to known zero state
-      buildControlRegUpdate(CR_Mask, true);
+      buildControlRegUpdate(CRMask, true);
 
       // Set rounding mode to required state if that isn't zero
-      FloatControl &= CR_Mask;
+      FloatControl &= CRMask;
       if (FloatControl) {
         if (FG->getHead() == Func)
           DefaultFloatControl = FloatControl;
@@ -3424,7 +3441,7 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
     unsigned RoundedWidth = roundedVal(Width, 4u);
     Type *DataType = CI->getType();
     if (DataType->isVoidTy())
-      DataType = CI->getOperand(CI->getNumArgOperands() - 1)->getType();
+      DataType = CI->getOperand(IGCLLVM::getNumArgOperands(CI) - 1)->getType();
     unsigned DataSize;
     if (VectorType *VT = dyn_cast<VectorType>(DataType))
       DataSize = DL.getTypeSizeInBits(VT) / genx::ByteBits;
@@ -3691,7 +3708,7 @@ void GenXKernelBuilder::buildIntrinsic(CallInst *CI, unsigned IntrinID,
     auto BaseArg = AI.getArgIdx();
     MaxRawOperands = BaseArg;
 
-    for (unsigned Idx = BaseArg; Idx < CI->getNumArgOperands(); ++Idx) {
+    for (unsigned Idx = BaseArg; Idx < IGCLLVM::getNumArgOperands(CI); ++Idx) {
       if (auto CA = dyn_cast<Constant>(CI->getArgOperand(Idx))) {
         if (CA->isNullValue())
           continue;
@@ -5077,7 +5094,7 @@ bool GenXKernelBuilder::isInLoop(BasicBlock *BB) {
     auto CI = dyn_cast<CallInst>(ui->getUser());
     if (!checkFunctionCall(CI, BBFunc))
       continue;
-    IGC_ASSERT(ui->getOperandNo() == CI->getNumArgOperands());
+    IGC_ASSERT(ui->getOperandNo() == IGCLLVM::getNumArgOperands(CI));
     if (CI->getFunction() == BBFunc)
       continue;
     if (isInLoop(CI->getParent())) {
@@ -5480,15 +5497,15 @@ void GenXKernelBuilder::buildRet(ReturnInst *RI) {
   F->getFnAttribute(genx::FunctionMD::CMFloatControl)
       .getValueAsString()
       .getAsInteger(0, FloatControl);
-  FloatControl &= CR_Mask;
+  FloatControl &= CRMask;
   if (FloatControl != DefaultFloatControl) {
-    buildControlRegUpdate(CR_Mask, true);
+    buildControlRegUpdate(CRMask, true);
     if (DefaultFloatControl)
       buildControlRegUpdate(DefaultFloatControl, false);
   }
   if (vc::requiresStackCall(Func)) {
     CISA_CALL(Kernel->AppendVISACFFunctionRetInst(nullptr, vISA_EMASK_M1,
-                                                  EXEC_SIZE_16));
+                                                  StackCallExecSize));
   } else {
     CISA_CALL(Kernel->AppendVISACFRetInst(nullptr, vISA_EMASK_M1, EXEC_SIZE_1));
   }
@@ -6093,17 +6110,18 @@ void GenXKernelBuilder::beginFunction(Function *Func) {
     unsigned RowOff = 0, ColOff = 0, SrcRowOff = 0, SrcColOff = 0;
     bool StackStarted = false;
     unsigned NoStackSize = 0;
+    unsigned ArgKernelSize = 0;
     // NOTE: using reverse iterators for args would be much better we don't have
     // any though
     for (auto &FArg : Func->args()) {
       if (Liveness->getLiveRange(&FArg) &&
-          Liveness->getLiveRange(&FArg)->getCategory() == vc::RegCategory::EM)
+          !isRealCategory(Liveness->getLiveRange(&FArg)->getCategory()))
         continue;
 
       RowOff = 0, ColOff = 0;
       unsigned ArgSize = getValueSize(FArg.getType());
       if (SrcColOff &&
-          (FArg.getType()->isVectorTy() || ArgSize > (GrfByteSize - ColOff))) {
+          (FArg.getType()->isVectorTy() || ArgSize > GrfByteSize)) {
         SrcRowOff++;
         SrcColOff = 0;
         NoStackSize++;
@@ -6137,6 +6155,7 @@ void GenXKernelBuilder::beginFunction(Function *Func) {
                       SrcColOff, StackOff);
         }
       }
+      ArgKernelSize += ArgSize/GrfByteSize > 0 ? ArgSize/GrfByteSize : 1;
       Sz += ArgSize;
     }
     if (!StackStarted && ColOff)
@@ -6152,7 +6171,7 @@ void GenXKernelBuilder::beginFunction(Function *Func) {
 
     StackCallee->SetFunctionInputSize(NoStackSize);
     StackCallee->SetFunctionReturnSize(RetSize);
-    StackCallee->AddKernelAttribute("ArgSize", 1, &NoStackSize);
+    StackCallee->AddKernelAttribute("ArgSize", 1, &ArgKernelSize);
     StackCallee->AddKernelAttribute("RetValSize", 1, &RetSize);
   }
 }
@@ -6355,14 +6374,14 @@ void GenXKernelBuilder::buildStackCallLight(CallInst *CI,
           ->getZExtValue();
   if (Callee) {
     CISA_CALL(Kernel->AppendVISACFFunctionCallInst(
-        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), EXEC_SIZE_16,
+        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), StackCallExecSize,
         Callee->getName().str(), ArgSize, RetSize));
   } else {
     auto *FuncAddr = createSource(IGCLLVM::getCalledValue(CI), DONTCARESIGNED);
     IGC_ASSERT(FuncAddr);
     CISA_CALL(Kernel->AppendVISACFIndirectFuncCallInst(
-        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), EXEC_SIZE_16,
-        FuncAddr, ArgSize, RetSize));
+        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), StackCallExecSize, FuncAddr,
+        ArgSize, RetSize));
   }
 }
 
@@ -6374,7 +6393,7 @@ void GenXKernelBuilder::buildStackCall(CallInst *CI,
 
   // Check whether the called function has a predicate arg that is EM.
   int EMOperandNum = -1, EMIdx = -1;
-  for (auto &Arg : CI->arg_operands()) {
+  for (auto &Arg : IGCLLVM::args(CI)) {
     ++EMIdx;
     if (!Arg->getType()->getScalarType()->isIntegerTy(1))
       continue;
@@ -6385,7 +6404,7 @@ void GenXKernelBuilder::buildStackCall(CallInst *CI,
   }
 
   int TotalArgSize = 0;
-  for (auto &CallArg : CI->arg_operands())
+  for (auto &CallArg : IGCLLVM::args(CI))
     TotalArgSize += getValueSize(CallArg->getType());
 
   VISA_GenVar *Sp = nullptr, *Arg = nullptr, *Ret = nullptr;
@@ -6399,7 +6418,7 @@ void GenXKernelBuilder::buildStackCall(CallInst *CI,
   uint64_t StackOff = 0;
   bool StackStarted = false;
   // pack arguments
-  for (auto &CallArg : CI->arg_operands()) {
+  for (auto &CallArg : IGCLLVM::args(CI)) {
     auto *CallArgLR = Liveness->getLiveRangeOrNull(CallArg.get());
     if (CallArgLR && CallArgLR->getCategory() == vc::RegCategory::EM)
       continue;
@@ -6474,12 +6493,12 @@ void GenXKernelBuilder::buildStackCall(CallInst *CI,
   }
 
   VISA_PredOpnd *Pred = nullptr;
-  VISA_Exec_Size Esz = EXEC_SIZE_16;
+  VISA_Exec_Size ExecSize = StackCallExecSize;
   if (EMOperandNum >= 0) {
     Pred = createPred(CI, BaleInfo(), EMOperandNum);
     auto *VTy = cast<IGCLLVM::FixedVectorType>(
         CI->getArgOperand(EMOperandNum)->getType());
-    Esz = getExecSizeFromValue(VTy->getNumElements());
+    ExecSize = getExecSizeFromValue(VTy->getNumElements());
   }
 
   auto *RetVar = &CisaVars[Kernel].at("retv");
@@ -6499,14 +6518,14 @@ void GenXKernelBuilder::buildStackCall(CallInst *CI,
                 GrfByteSize;
   if (Callee) {
     CISA_CALL(Kernel->AppendVISACFFunctionCallInst(
-        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), EXEC_SIZE_16,
+        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), ExecSize,
         Callee->getName().str(), NoStackSize, RetSize));
   } else {
     auto *FuncAddr = createSource(IGCLLVM::getCalledValue(CI), DONTCARESIGNED);
     IGC_ASSERT(FuncAddr);
     CISA_CALL(Kernel->AppendVISACFIndirectFuncCallInst(
-        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), EXEC_SIZE_16,
-        FuncAddr, NoStackSize, RetSize));
+        Pred, (NoMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1), ExecSize, FuncAddr,
+        NoStackSize, RetSize));
   }
 
   unsigned StackRetSz = 0;
@@ -6626,6 +6645,7 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
     Argv.push_back(Saver.save(Arg).data());
   };
 
+  const WA_TABLE* WATable = BC.getWATable();
   // enable preemption if subtarget supports it
   if (ST.hasPreemption())
     addArgument("-enablePreemption");
@@ -6662,8 +6682,10 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
     addArgument("-TotalGRFNum");
     addArgument("256");
   }
-  if (ST.hasFusedEU())
+  if (ST.hasFusedEU()) {
     addArgument("-fusedCallWA");
+    addArgument("1");
+  }
   return Argv;
 }
 

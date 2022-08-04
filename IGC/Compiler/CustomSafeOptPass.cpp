@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -13,7 +13,7 @@ See LICENSE.TXT for details.
 
 ============================= end_copyright_notice ===========================*/
 
-/*========================== CustomUnsafeOptPass.cpp ==========================
+/*========================== CustomSafeOptPass.cpp ==========================
 
 This file contains IGC custom optimizations that are arithmetically safe.
 The passes are
@@ -31,13 +31,13 @@ CustomSafeOptPass does peephole optimizations
 For example, reduce the alloca size so there is a chance to promote indexed temp.
 
 GenSpecificPattern reverts llvm changes back to what is needed.
-For example, llvm changes AND to OR, and GenSpecificPaattern changes it back to
+For example, llvm changes AND to OR, and GenSpecificPattern changes it back to
 allow more optimizations
 
 IGCConstProp was originated from llvm copy-prop code with one addition for
 shader-constant replacement. So llvm copyright is added above.
 
-IGCIndirectICBPropagaion reads the immediate constant buffer from meta data and
+IGCIndirectICBPropagation reads the immediate constant buffer from meta data and
 use them as immediates instead of using send messages to read from buffer.
 
 CustomLoopInfo returns true if there is any sampleL in a loop for the driver.
@@ -245,7 +245,7 @@ void CustomSafeOptPass::visitAnd(BinaryOperator& I) {
         return;
     }
 
-    Value* XorArgValue;
+    Value* XorArgValue = nullptr;
     CmpInst::Predicate Pred;
     auto AndPattern = m_c_And(m_c_Xor(m_Value(XorArgValue), m_SpecificInt(1)), m_ICmp(Pred, m_Value(), m_Value()));
     if (!match(&I, AndPattern)) return;
@@ -502,7 +502,7 @@ void CustomSafeOptPass::visitAllocaInst(AllocaInst& I)
     IGCLLVM::IRBuilder<> IRB(&I);
     llvm::ArrayType* allocaArraySize = llvm::ArrayType::get(pType->getArrayElementType(), newSize);
     llvm::Value* newAlloca = IRB.CreateAlloca(allocaArraySize, nullptr);
-    llvm::Value* gepArg1;
+    llvm::Value* gepArg1 = nullptr;
 
     llvm::Function* userFunc = I.getParent()->getParent();
     llvm::Module& M = *userFunc->getParent();
@@ -528,7 +528,6 @@ void CustomSafeOptPass::visitAllocaInst(AllocaInst& I)
             }
         }
     }
-
 
     for (Value::user_iterator it = I.user_begin(), e = I.user_end(); it != e; ++it) {
         if (GetElementPtrInst * pGEP = llvm::dyn_cast<GetElementPtrInst>(*it)) {
@@ -605,7 +604,6 @@ void CustomSafeOptPass::visitLoadInst(LoadInst& load)
                     break;
                 }
             }
-
         }
         if (found)
         {
@@ -638,9 +636,7 @@ void CustomSafeOptPass::visitLoadInst(LoadInst& load)
                 sel->eraseFromParent();
             }
         }
-
     }
-
 }
 
 void CustomSafeOptPass::visitCallInst(CallInst& C)
@@ -951,7 +947,6 @@ void CustomSafeOptPass::visitFPTruncInst(FPTruncInst& I)
             }
         }
     }
-
 }
 
 void CustomSafeOptPass::visitFPToUIInst(llvm::FPToUIInst& FPUII)
@@ -1122,7 +1117,6 @@ void CustomSafeOptPass::matchDp4a(BinaryOperator &I) {
         return;
       }
     }
-
 
     // Check if values in A and B all have the same extension type (sext/zext)
     // and that they come from i8 type. A and B extension types can be
@@ -1303,22 +1297,22 @@ void CustomSafeOptPass::matchMixOperation(BinaryOperator& I)
                 bool doNotOptimize = false;
                 bool matchFound = false;
                 SmallVector<std::pair<Instruction*, Instruction*>, 3> fMulInsts;
+                SmallVector<Instruction*, 3> fAddInsts;
 
                 // Pattern Mix check step 2: there should be only FMul users of this FSub instruction
-                for (User* U : I.users())
+                for (User* subU : I.users())
                 {
                     matchFound = false;
-                    Instruction* fMul = dyn_cast_or_null<Instruction>(U);
+                    Instruction* fMul = dyn_cast_or_null<Instruction>(subU);
                     if (fMul && fMul->getOpcode() == BinaryOperator::FMul)
                     {
-                        // Pattern Mix check step 3: there should be only one fAdd user for such an FMul instruction
-                        if ((cast<Value>(fMul))->hasOneUse())
+                        // Pattern Mix check step 3: there should be only fAdd users for such an FMul instruction
+                        for (User* mulU : fMul->users())
                         {
-                            Instruction* fAdd = dyn_cast_or_null<Instruction>(*fMul->users().begin());
-
-                            // Pattern Mix check step 4: fAdd should be a user of two FMul instructions
+                            Instruction* fAdd = dyn_cast_or_null<Instruction>(mulU);
                             if (fAdd && fAdd->getOpcode() == BinaryOperator::FAdd)
                             {
+                                // Pattern Mix check step 4: fAdd should be a user of two FMul instructions
                                 unsigned int opIdx = 0;
                                 while (opIdx < 2 && fMul != fAdd->getOperand(opIdx))
                                 {
@@ -1335,14 +1329,16 @@ void CustomSafeOptPass::matchMixOperation(BinaryOperator& I)
                                     if (fMul2nd && fMul2nd->getOpcode() == BinaryOperator::FMul)
                                     {
                                         unsigned int fSubNon1OpIdx = 1 - fSubOpIdx; // 0 -> 1 or 1 -> 0
-                                        while (opIdx < 2 && fMul2nd->getOperand(opIdx) != I.getOperand(fSubNon1OpIdx))
+                                        unsigned int fMul2OpIdx = 0;
+                                        while (fMul2OpIdx < 2 && fMul2nd->getOperand(fMul2OpIdx) != I.getOperand(fSubNon1OpIdx))
                                         {
-                                            opIdx++;
+                                            fMul2OpIdx++;
                                         }
 
-                                        if (opIdx < 2)
+                                        if (fMul2OpIdx < 2)
                                         {
                                             fMulInsts.push_back(std::make_pair(fMul, fMul2nd));
+                                            fAddInsts.push_back(fAdd);
                                             matchFound = true;  // Pattern Mix (partially) detected.
                                         }
                                     }
@@ -1373,9 +1369,13 @@ void CustomSafeOptPass::matchMixOperation(BinaryOperator& I)
                     fSubOpIdx = 1 - fSubOpIdx; // 0 -> 1 or 1 -> 0, i.e. get another FSub operand
                     Value* r = I.getOperand(fSubOpIdx);
 
-                    for (std::pair<Instruction*, Instruction*> fMulPair : fMulInsts)
+                    while (!fMulInsts.empty())
                     {
-                        Instruction* fAdd = cast<Instruction>(*fMulPair.first->users().begin());
+                        std::pair<Instruction*, Instruction*> fMulPair = fMulInsts.back();
+                        fMulInsts.pop_back();
+
+                        Instruction* fAdd = fAddInsts.back();
+                        fAddInsts.pop_back();
 
                         unsigned int fMul2OpToFirstInstIdx = (r == fMulPair.second->getOperand(0)) ? 1 : 0;
                         Value* newFirstInstOp = fMulPair.second->getOperand(fMul2OpToFirstInstIdx);
@@ -2014,7 +2014,7 @@ void IGC::CustomSafeOptPass::visitSampleBptr(llvm::SampleIntrinsic* sampleInst)
     {
         // Copy args skipping bias operand:
         llvm::SmallVector<llvm::Value*, 10> args;
-        for (unsigned int i = 1; i < sampleInst->getNumArgOperands(); i++)
+        for (unsigned int i = 1; i < IGCLLVM::getNumArgOperands(sampleInst); i++)
         {
             args.push_back(sampleInst->getArgOperand(i));
         }
@@ -2221,7 +2221,6 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     addI[2]->replaceAllUsesWith(sel3);
 }
 
-
 void CustomSafeOptPass::visitExtractElementInst(ExtractElementInst& I)
 {
     // convert:
@@ -2341,7 +2340,6 @@ bool TrivialLocalMemoryOpsElimination::runOnFunction(Function& F)
     m_LocalLoadsToRemove.clear();
     m_LocalFencesBariersToRemove.clear();
 
-
     return change;
 }
 
@@ -2447,8 +2445,7 @@ void TrivialLocalMemoryOpsElimination::visitCallInst(CallInst& I)
             }
         }
     }
-
-}
+ }
 #endif
 
 // Register pass to igc-opt
@@ -3483,7 +3480,7 @@ void GenSpecificPattern::visitLoadInst(LoadInst &LI) {
         return;
 
     auto VectorLoadInst = cast<LoadInst>(Op0->getVectorOperand());
-    if (VectorLoadInst->getNumUses() != 2)
+    if (!VectorLoadInst->hasNUses(2))
         return;
 
     auto PointerOperand = VectorLoadInst->getPointerOperand();
@@ -3535,7 +3532,7 @@ void GenSpecificPattern::visitTruncInst(llvm::TruncInst& I)
 
     using namespace llvm::PatternMatch;
     Value* LHS = nullptr;
-    ConstantInt* CI;
+    ConstantInt* CI = nullptr;
     if (match(&I, m_Trunc(m_LShr(m_Value(LHS), m_ConstantInt(CI)))) &&
         I.getType()->isIntegerTy(32) &&
         LHS->getType()->isIntegerTy(64) &&
@@ -4355,7 +4352,7 @@ namespace {
             AU.addRequired<CodeGenContextWrapper>();
         }
     private:
-        bool isICBOffseted(llvm::LoadInst* inst, uint offset);
+        bool isICBOffseted(llvm::LoadInst* inst, uint offset, uint& offsetIntoMergedBuffer);
     };
 
 } // namespace
@@ -4373,8 +4370,6 @@ bool IGCIndirectICBPropagaion::runOnFunction(Function& F)
         modMD->immConstant.data.size() &&
         modMD->immConstant.data.size() <= IGC_GET_FLAG_VALUE(MaxImmConstantSizePushed))
     {
-        uint maxImmConstantSizePushed = modMD->immConstant.data.size();
-        char* offset = &(modMD->immConstant.data[0]);
         IRBuilder<> m_builder(F.getContext());
 
         for (auto& BB : F)
@@ -4384,13 +4379,14 @@ bool IGCIndirectICBPropagaion::runOnFunction(Function& F)
                 if (llvm::LoadInst * inst = llvm::dyn_cast<llvm::LoadInst>(&(*BI++)))
                 {
                     unsigned as = inst->getPointerAddressSpace();
-                    bool directBuf;
-                    unsigned bufId;
+                    bool directBuf = false;
+                    unsigned bufId = 0;
+                    unsigned offsetIntoMergedBuffer = 0;
                     BufferType bufType = IGC::DecodeAS4GFXResource(as, directBuf, bufId);
                     bool bICBNoOffset =
                         (IGC::INVALID_CONSTANT_BUFFER_INVALID_ADDR == modMD->pushInfo.inlineConstantBufferOffset && bufType == CONSTANT_BUFFER && directBuf && bufId == modMD->pushInfo.inlineConstantBufferSlot);
                     bool bICBOffseted =
-                        (IGC::INVALID_CONSTANT_BUFFER_INVALID_ADDR != modMD->pushInfo.inlineConstantBufferOffset && ADDRESS_SPACE_CONSTANT == as && isICBOffseted(inst, modMD->pushInfo.inlineConstantBufferOffset));
+                        (IGC::INVALID_CONSTANT_BUFFER_INVALID_ADDR != modMD->pushInfo.inlineConstantBufferOffset && ADDRESS_SPACE_CONSTANT == as && isICBOffseted(inst, modMD->pushInfo.inlineConstantBufferOffset, offsetIntoMergedBuffer));
                     if (bICBNoOffset || bICBOffseted)
                     {
                         Value* ptrVal = inst->getPointerOperand();
@@ -4426,6 +4422,8 @@ bool IGCIndirectICBPropagaion::runOnFunction(Function& F)
                         unsigned int size_in_bytes = (unsigned int)inst->getType()->getPrimitiveSizeInBits() / 8;
                         if (size_in_bytes)
                         {
+                            uint maxImmConstantSizePushed = !modMD->immConstant.sizes.empty() ? modMD->immConstant.sizes[offsetIntoMergedBuffer] : modMD->immConstant.data.size();
+                            char* offset = &(modMD->immConstant.data[0]) + offsetIntoMergedBuffer;
                             Value* ICBbuffer = UndefValue::get(IGCLLVM::FixedVectorType::get(inst->getType(), maxImmConstantSizePushed / size_in_bytes));
                             if (inst->getType()->isFloatTy())
                             {
@@ -4470,7 +4468,7 @@ bool IGCIndirectICBPropagaion::runOnFunction(Function& F)
     return false;
 }
 
-bool IGCIndirectICBPropagaion::isICBOffseted(llvm::LoadInst* inst, uint offset) {
+bool IGCIndirectICBPropagaion::isICBOffseted(llvm::LoadInst* inst, uint offset, uint& offsetIntoMergedBuffer) {
     Value* ptrVal = inst->getPointerOperand();
     std::vector<Value*> srcInstList;
     IGC::TracePointerSource(ptrVal, false, true, true, srcInstList);
@@ -4480,6 +4478,24 @@ bool IGCIndirectICBPropagaion::isICBOffseted(llvm::LoadInst* inst, uint offset) 
         GenIntrinsicInst* genIntr = inst ? dyn_cast<GenIntrinsicInst>(inst) : nullptr;
         if (!genIntr || (genIntr->getIntrinsicID() != GenISAIntrinsic::GenISA_RuntimeValue))
             return false;
+
+        // ICB may contain multiple ICBs merged into one
+        // find getelementptr after GenISA_RuntimeValue to find offset to needed ICB in merged ICB
+        if (srcInstList.size() >= 2)
+        {
+            GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(srcInstList[srcInstList.size() - 2]);
+
+            if (gep &&
+                gep->getNumOperands() == 2 &&
+                gep->getOperand(0) == genIntr &&
+                genIntr->getType() == PointerType::get(Type::getInt8Ty(inst->getContext()), ADDRESS_SPACE_CONSTANT))
+            {
+                llvm::ConstantInt* ci = dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
+
+                if (ci)
+                    offsetIntoMergedBuffer = (uint)ci->getZExtValue();
+            }
+        }
 
         llvm::ConstantInt* ci = dyn_cast<llvm::ConstantInt>(inst->getOperand(0));
         return ci && (uint)ci->getZExtValue() == offset;
@@ -5010,49 +5026,48 @@ IGC_INITIALIZE_PASS_BEGIN(GenStrengthReduction, "GenStrengthReduction",
     IGC_INITIALIZE_PASS_END(GenStrengthReduction, "GenStrengthReduction",
         "GenStrengthReduction", false, false)
 
+/*========================== FlattenSmallSwitch ==============================
 
-    /*========================== FlattenSmallSwitch ==============================
+This class flattens small switch. For example,
 
-    This class flattens small switch. For example,
+before optimization:
+    then153:
+    switch i32 %115, label %else229 [
+    i32 1, label %then214
+    i32 2, label %then222
+    i32 3, label %then222 ; duplicate blocks are fine
+    ]
 
-    before optimization:
-        then153:
-        switch i32 %115, label %else229 [
-        i32 1, label %then214
-        i32 2, label %then222
-        i32 3, label %then222 ; duplicate blocks are fine
-        ]
+    then214:                                          ; preds = %then153
+    %150 = fdiv float 1.000000e+00, %res_s208
+    %151 = fmul float %147, %150
+    br label %ifcont237
 
-        then214:                                          ; preds = %then153
-        %150 = fdiv float 1.000000e+00, %res_s208
-        %151 = fmul float %147, %150
-        br label %ifcont237
+    then222:                                          ; preds = %then153
+    %152 = fsub float 1.000000e+00, %141
+    br label %ifcont237
 
-        then222:                                          ; preds = %then153
-        %152 = fsub float 1.000000e+00, %141
-        br label %ifcont237
+    else229:                                          ; preds = %then153
+    %res_s230 = icmp eq i32 %115, 3
+    %. = select i1 %res_s230, float 1.000000e+00, float 0.000000e+00
+    br label %ifcont237
 
-        else229:                                          ; preds = %then153
-        %res_s230 = icmp eq i32 %115, 3
-        %. = select i1 %res_s230, float 1.000000e+00, float 0.000000e+00
-        br label %ifcont237
+    ifcont237:                                        ; preds = %else229, %then222, %then214
+    %"r[9][0].x.0" = phi float [ %151, %then214 ], [ %152, %then222 ], [ %., %else229 ]
 
-        ifcont237:                                        ; preds = %else229, %then222, %then214
-        %"r[9][0].x.0" = phi float [ %151, %then214 ], [ %152, %then222 ], [ %., %else229 ]
+after optimization:
+    %res_s230 = icmp eq i32 %115, 3
+    %. = select i1 %res_s230, float 1.000000e+00, float 0.000000e+00
+    %150 = fdiv float 1.000000e+00, %res_s208
+    %151 = fmul float %147, %150
+    %152 = icmp eq i32 %115, 1
+    %153 = select i1 %152, float %151, float %.
+    %154 = fsub float 1.000000e+00, %141
+    %155 = icmp eq i32 %115, 2
+    %156 = select i1 %155, float %154, float %153
 
-    after optimization:
-        %res_s230 = icmp eq i32 %115, 3
-        %. = select i1 %res_s230, float 1.000000e+00, float 0.000000e+00
-        %150 = fdiv float 1.000000e+00, %res_s208
-        %151 = fmul float %147, %150
-        %152 = icmp eq i32 %115, 1
-        %153 = select i1 %152, float %151, float %.
-        %154 = fsub float 1.000000e+00, %141
-        %155 = icmp eq i32 %115, 2
-        %156 = select i1 %155, float %154, float %153
-
-    =============================================================================*/
-    namespace {
+=============================================================================*/
+namespace {
     class FlattenSmallSwitch : public FunctionPass
     {
     public:
@@ -5065,7 +5080,6 @@ IGC_INITIALIZE_PASS_BEGIN(GenStrengthReduction, "GenStrengthReduction",
         virtual bool runOnFunction(Function& F);
         bool processSwitchInst(SwitchInst* SI);
     };
-
 } // namespace
 
 char FlattenSmallSwitch::ID = 0;
@@ -5468,7 +5482,6 @@ namespace {
         bool isProfitableToSplit(uint64_t num, int64_t mul, int64_t add);
         bool didSomething;
     };
-
 } // namespace
 
 
@@ -5542,7 +5555,6 @@ void SplitIndirectEEtoSel::visitExtractElementInst(llvm::ExtractElementInst& I)
     int64_t add = 0;
     int64_t mul = 1;
 
-
     /* strip mul/add from index calculation and remember it for later:
        %268 = mul nuw i32 %res.i2.i, 3
        %270 = add i32 %268, 1
@@ -5600,7 +5612,7 @@ void SplitIndirectEEtoSel::visitExtractElementInst(llvm::ExtractElementInst& I)
             continue;
 
         // Those 2 might be different, when cmp will get altered by it's operands, but EE index stays the same
-        ConstantInt* cmpIndexCI = llvm::ConstantInt::get(builder.getInt32Ty(), (uint64_t)cmpIndex);
+        ConstantInt* cmpIndexCI = llvm::ConstantInt::get(dyn_cast<IntegerType>(index->getType()), (uint64_t)cmpIndex);
         ConstantInt* eeiIndexCI = llvm::ConstantInt::get(builder.getInt32Ty(), (uint64_t)elemIndex);
 
         Value* cmp = builder.CreateICmp(CmpInst::Predicate::ICMP_EQ, index, cmpIndexCI);
@@ -5656,7 +5668,6 @@ namespace {
         void convertAndToBranch(Instruction* opAnd,
             Instruction* cond0, Instruction* cond1, BasicBlock*& newBB);
     };
-
 }
 
 IGC_INITIALIZE_PASS_BEGIN(LogicalAndToBranch, "logicalAndToBranch", "logicalAndToBranch", false, false)
@@ -5954,7 +5965,6 @@ namespace {
 #define PASS_ANALYSIS false
 IGC_INITIALIZE_PASS_BEGIN(CleanPHINode, PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
 IGC_INITIALIZE_PASS_END(CleanPHINode,   PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
-
 
 char CleanPHINode::ID = 0;
 FunctionPass* IGC::createCleanPHINodePass()
@@ -6262,7 +6272,7 @@ bool InsertBranchOpt::HasSrcFromEE(Instruction* I, uint selNum, Instruction*& lo
             }
             // load in the same BB as the extractElement
             if (load->getParent() == I->getParent() &&
-                load->getNumUses() <= selNum &&
+                !load->hasNUsesOrMore(1 + selNum) &&
                 eetemp->hasOneUse())
             {
                 loadInst = load;
@@ -6588,10 +6598,8 @@ void InsertBranchOpt::atomicSpiltOpt(Function& F)
     }
 }
 
-
 void typedWriteZeroStoreCheck(Function& F)
 {
-
     for (auto BI = F.begin(), BE = F.end(); BI != BE; ++BI)
     {
         for (auto II = BI->begin(); II != BI->end(); ++II)
@@ -6642,14 +6650,12 @@ void typedWriteZeroStoreCheck(Function& F)
                     }
 
                     //if all checks are green, can set up tyW and tyr
-
                     if (!checksAreGreen)
                     {
                         continue;
                     }
 
                     //Check phi node to find target block and if phi node can have 0
-
                     BasicBlock* fromBB = nullptr;
                     bool allPhiContainsZeroAndOnlyOneNonZero = false;
                     bool breakOut = false;
@@ -6664,7 +6670,6 @@ void typedWriteZeroStoreCheck(Function& F)
                             {
                                 for (unsigned int predIndex = 0; predIndex < p->getNumIncomingValues(); ++predIndex)
                                 {
-
                                     if (ConstantFP* fp = dyn_cast<ConstantFP>(p->getIncomingValue(predIndex)))
                                     {
                                         if (!fp->isZero())
@@ -6730,17 +6735,13 @@ void typedWriteZeroStoreCheck(Function& F)
                                         {
                                             currentNodeContainsZero = false;
                                         }
-
                                     }
-
-
                                 }
                             }
                             else
                             {
                                 allPhiContainsZeroAndOnlyOneNonZero = false;
                             }
-
 
                             //Break out and return if one of the phi nodes can't have 0 or has more than one nonzero
                             if (allPhiContainsZeroAndOnlyOneNonZero)
@@ -6758,8 +6759,6 @@ void typedWriteZeroStoreCheck(Function& F)
                             breakOut = true;
                             break;
                         }
-
-
                     }
 
                     Instruction* tyW = cast<GenIntrinsicInst>(tyWrite);
@@ -6797,43 +6796,46 @@ void typedWriteZeroStoreCheck(Function& F)
                         }
                     }
 
-                    if (u != nullptr && addIntoOpt != nullptr)
+                    IGC_ASSERT( fromBB != nullptr );
+                    if (fromBB != nullptr)
                     {
-                        addIntoOpt->insertBefore(fromBB->getTerminator());
-                        u->insertBefore(fromBB->getTerminator());
-                        u->setOperand(0, addIntoOpt);
+                        if (u != nullptr && addIntoOpt != nullptr)
+                        {
+                            addIntoOpt->insertBefore(fromBB->getTerminator());
+                            u->insertBefore(fromBB->getTerminator());
+                            u->setOperand(0, addIntoOpt);
+                        }
+                        tyR->setOperand(0, u);
+                        tyR->removeFromParent();
+                        tyR->insertBefore(fromBB->getTerminator());
+
+                        //How to check for redundant inst?
+                        for (int k = 0; k < 3; k++)
+                        {
+                            eeInst[k]->removeFromParent();
+                            eeInst[k]->insertBefore(fromBB->getTerminator());
+                        }
+
+                        //ensure that the fmul instructions are given the values that the phi nodes had
+
+                        for (int i = 0; i < 3; i++)
+                        {
+                            PHINode* ph = dyn_cast<PHINode>(fmulInst[i]->getOperand(1));
+                            Value* val = ph->getIncomingValue(0);
+                            fmulInst[i]->setOperand(1, val);
+                            fmulInst[i]->removeFromParent();
+                            fmulInst[i]->insertBefore(fromBB->getTerminator());
+                            faddInst[i]->removeFromParent();
+                            faddInst[i]->insertBefore(fromBB->getTerminator());
+                        }
+
+                        tyW->setOperand(0, u);
+                        tyW->removeFromParent();
+                        tyW->insertBefore(fromBB->getTerminator());
                     }
-                    tyR->setOperand(0, u);
-                    tyR->removeFromParent();
-                    tyR->insertBefore(fromBB->getTerminator());
-
-                    //How to check for redundant inst?
-                    for (int k = 0; k < 3; k++)
-                    {
-                        eeInst[k]->removeFromParent();
-                        eeInst[k]->insertBefore(fromBB->getTerminator());
-                    }
-
-                    //ensure that the fmul instructions are given the values that the phi nodes had
-
-                    for (int i = 0; i < 3; i++)
-                    {
-                        PHINode* ph = dyn_cast<PHINode>(fmulInst[i]->getOperand(1));
-                        Value* val = ph->getIncomingValue(0);
-                        fmulInst[i]->setOperand(1, val);
-                        fmulInst[i]->removeFromParent();
-                        fmulInst[i]->insertBefore(fromBB->getTerminator());
-                        faddInst[i]->removeFromParent();
-                        faddInst[i]->insertBefore(fromBB->getTerminator());
-                    }
-
-                    tyW->setOperand(0, u);
-                    tyW->removeFromParent();
-                    tyW->insertBefore(fromBB->getTerminator());
                 }
             }
         }
-
     }
 }
 
@@ -6854,4 +6856,3 @@ bool InsertBranchOpt::runOnFunction(Function& F)
 
     return false;
 }
-

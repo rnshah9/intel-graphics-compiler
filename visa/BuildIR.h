@@ -49,6 +49,13 @@ typedef struct FCCalls
     const char* calleeLabelString;
 } FCCalls;
 
+struct OperandLengths
+{
+    int dstLen;
+    int src0Len;
+    int src1Len;
+};
+
 enum DeclareType
 {
     Regular = 0,
@@ -814,9 +821,9 @@ public:
     G4_Declare* createHardwiredDeclare(
         uint32_t numElements, G4_Type type, uint32_t regNum, uint32_t regOff);
 
-    G4_INST* createPseudoKills(std::initializer_list<G4_Declare*> dcls, PseudoKillType ty);
+    void createPseudoKills(std::initializer_list<G4_Declare*> dcls, PseudoKillType ty);
 
-    G4_INST* createPseudoKill(G4_Declare* dcl, PseudoKillType ty);
+    G4_INST* createPseudoKill(G4_Declare* dcl, PseudoKillType ty, bool addToInstList);
 
     G4_INST* createEUWASpill(bool addToInstList);
 
@@ -1150,9 +1157,10 @@ public:
     // kernel and all its functions (within CISA_IR_BUILDER).
     // It is in the form:
     //
-    //       label name:  _[<kernelName>|L]_f<functionId>_<func_local_label_id>_<lab>
+    //    label name:  _[<kernelName>|L]_[k|f]<functionId>_<func_local_label_id>_<lab>
     //
-    //    where optional <lab> is used for annotating the label for readability.
+    //    where optional <lab> is used for annotating the label for readability; and
+    //    'k' is for kernel entry and 'f' is for function.
     // If no kernel name or kernel name is too long, the label will start with "_L".
     //
     G4_Label* createLocalBlockLabel(const std::string& lab = "")
@@ -1163,7 +1171,9 @@ public:
         {
             std::string tName = sanitizeLabelString(cstr_kname);
             // cstr_kname is just for readability. If it is too long, don't use it.
-            if (tName.size() != 0 && tName.size() <= 30)
+            // Also, make sure cstr_kname does not start with "_L_" to make sure it
+            // would never be the same as any internal flag (starts with "_L_").
+            if (tName.size() != 0 && tName.size() <= 30 && tName.find("_L_") != 0)
             {
                 kname = tName;
             }
@@ -1171,7 +1181,12 @@ public:
 
         std::stringstream ss;
         uint32_t lbl_id = getAndUpdateNextLabelId();
-        ss  << "_" << kname << "_f" << kernel.getFunctionId() << "_" << lbl_id << "_" << lab;
+        // kernel and function (getFunctionId()) are numbered independently.
+        // Make sure to use "k" for kernel entry and "f" for function to avoid
+        // the same label in kernel entry and the first function.
+        ss  << "_" << kname
+            << (getIsKernel() ? "_k" : "_f")
+            << kernel.getFunctionId() << "_" << lbl_id << "_" << lab;
         size_t len = ss.str().size() + 1;
         char* new_str = (char*)mem.alloc(len);  // +1 for null that ends the string
         memcpy_s(new_str, len, ss.str().c_str(), len);
@@ -1308,6 +1323,8 @@ public:
         G4_InstOpts options, // FIXME: re-order options to follow all operands
         G4_SendDesc *msgDesc,
         bool addToInstList);
+
+
     G4_InstSend* createInternalSendInst(
         G4_Predicate* prd, G4_opcode op,
         G4_ExecSize execSize,
@@ -1359,6 +1376,12 @@ public:
     G4_INST* createSync(G4_opcode syncOp, G4_Operand* src);
 
     G4_INST* createMov(
+        G4_ExecSize execSize,
+        G4_DstRegRegion* dst, G4_Operand* src0,
+        G4_InstOpts options,
+        bool appendToInstList);
+    G4_INST* createMov(
+        G4_Predicate *pred,
         G4_ExecSize execSize,
         G4_DstRegRegion* dst, G4_Operand* src0,
         G4_InstOpts options,
@@ -1447,7 +1470,8 @@ public:
         LSC_DATA_SHAPE        shape,
         G4_Operand           *surface,
         uint32_t              dstLen,
-        uint32_t              addrRegs);
+        uint32_t              addrRegs,
+        LdStAttrs             otherAttrs);
 
     // ToDo: unify this with above function
     G4_SendDescRaw* createLscDesc(
@@ -1456,7 +1480,8 @@ public:
         uint32_t extDesc,
         int src1Len,
         SendAccess access,
-        G4_Operand* bti);
+        G4_Operand* bti,
+        LdStAttrs   otherAttrs);
 
 
     G4_InstSend *createLscSendInst(
@@ -1854,10 +1879,29 @@ public:
 
     G4_Declare* getImmDcl(G4_Imm* val, int numElt);
 
+    //
+    // 'copyExecSize' and preparePayload's batchExSize together provide
+    // the execSize of copying instruction.
+    //     'copyExecSize' of PayloadSource is used for header only for now.
+    //     If 'copyExecSize' is present, use it; otherwise, use batchExSize
+    //     of preparePayload for copying.
+    //
+    //  For example,
+    //     send(4|M0)   nullptr  addr:a32 data:ud ...
+    //  will be changed to
+    //     mov(8|M0)    msgPayload(0,0) <1;1,0> header
+    //     mov(4|M0)    msgPayload(1,0) <1;1,0> addr
+    //     mov(4|M0)    msgPayload(2,0) <1;1,0> data
+    //     send(4|M0)   nullptr   msgPayload ...
+    //  where 'copyExecSize' will be 8 and batchExSize = 4.
+    //
     struct PayloadSource {
         G4_SrcRegRegion  *opnd;
-        G4_ExecSize       execSize;
+        uint32_t          numElts;       // 'opnd's size in msg payload
         G4_InstOpts       instOpt;
+        G4_ExecSize       copyExecSize;  // used for copy if given.
+
+        PayloadSource() : copyExecSize(g4::SIMD_UNDEFINED) {}
     };
 
     /// preparePayload - This method prepares payload from the specified header
@@ -1869,7 +1913,10 @@ public:
     ///                         2-element array must be cleared before calling
     ///                         preparePayload().
     /// \param batchExSize      When it's required to copy sources, batchExSize
-    ///                         specifies the SIMD width of copy.
+    ///                         specifies the SIMD width of copy except when
+    ///                         'copyExecSize' of PayloadSource is defined. And
+    ///                         in the case 'copyExecSize is defined, it's used as
+    ///                         execsize for copy.
     /// \param splitSendEnabled Whether feature split-send is available. When
     ///                         feature split-send is available, this function
     ///                         will check whether two consecutive regions
@@ -1883,6 +1930,7 @@ public:
         G4_SrcRegRegion *msgs[2], unsigned sizes[2],
         G4_ExecSize batchExSize, bool splitSendEnabled,
         PayloadSource sources[], unsigned len);
+
 
     // Coalesce multiple payloads into a single region.  Pads each region with
     // an optional alignment argument (e.g. a GRF size).  The source region
@@ -2025,6 +2073,7 @@ public:
         unsigned int numParms,
         G4_SrcRegRegion ** params);
 
+
     int translateVISALoad3DInst(
         VISASampler3DSubOpCode actualop,
         bool pixelNullMask,
@@ -2088,6 +2137,14 @@ public:
         return surface->isImm() &&
             (surface->asImm()->getImm() == PREDEF_SURF_255 || surface->asImm()->getImm() == PREDEF_SURF_253);
     }
+
+    std::tuple<G4_SrcRegRegion*, uint32_t, uint32_t>
+    constructSrcPayloadRenderTarget(
+        vISA_RT_CONTROLS cntrls,
+        G4_SrcRegRegion** msgOpnds,
+        unsigned int numMsgOpnds,
+        G4_ExecSize execSize,
+        G4_InstOpts instOpt);
 
     int translateVISAQWGatherInst(
         VISA_Exec_Size executionSize,
@@ -2438,7 +2495,9 @@ public:
 
     LSC_DATA_ELEMS lscGetElementNum(unsigned eNum) const;
     int  lscEncodeAddrSize(LSC_ADDR_SIZE addr_size, uint32_t &desc, int &status) const;
+    uint32_t lscComputeAddrSize(LSC_ADDR_SIZE addr_size, int &status) const;
     int  lscEncodeDataSize(LSC_DATA_SIZE data_size, uint32_t &desc, int &status) const;
+    uint32_t lscComputeDataSize(LSC_DATA_SIZE data_size, int &status) const;
     int  lscEncodeDataElems(LSC_DATA_ELEMS data_elems, uint32_t &desc, int &status) const;
     void lscEncodeDataOrder(LSC_DATA_ORDER t, uint32_t &desc, int &status) const;
     void lscEncodeCachingOpts(
@@ -2683,20 +2742,22 @@ public:
 
     ///////////////////////////////////////////////////////////////////////////
     ///////////////////////////////////////////////////////////////////////////
-    // Raw send related members are in VisaToG4/TranslateSendSync.cpp
+    // Send sync related members are in VisaToG4/TranslateSendSync.cpp
     G4_INST* translateLscFence(
+        G4_Predicate           *pred,
         SFID                    sfid,
         LSC_FENCE_OP            fenceOp,
         LSC_SCOPE               scope,
         int&                    status);
 
     G4_INST* translateLscFence(
+        G4_Predicate           *pred,
         SFID                    sfid,
         LSC_FENCE_OP            fenceOp,
         LSC_SCOPE               scope)
     {
         int status = VISA_SUCCESS;
-        return translateLscFence(sfid, fenceOp, scope, status);
+        return translateLscFence(pred, sfid, fenceOp, scope, status);
     }
     enum class NamedBarrierType
     {
@@ -2705,29 +2766,44 @@ public:
         BOTH
     };
 
+    ////////////////////////////////////////////////////////////////////////
+    // default barrier functions
+    void generateSingleBarrier(G4_Predicate* prd);
+    void generateBarrierSend(G4_Predicate* prd);
+    void generateBarrierWait(G4_Predicate* prd);
+    int translateVISASplitBarrierInst(G4_Predicate* prd, bool isSignal);
+
+    ////////////////////////////////////////////////////////////////////////
+    // named barrier functions
+    int translateVISANamedBarrierSignal(
+        G4_Predicate* prd, G4_Operand* barrierId, G4_Operand* threadCount);
+    int translateVISANamedBarrierWait(
+        G4_Predicate* prd, G4_Operand* barrierId);
     void generateNamedBarrier(
-        int numProducer, int numConsumer, NamedBarrierType type, G4_Operand* barrierId);
+        G4_Predicate* prd,
+        int numProducer, int numConsumer,
+        NamedBarrierType type, G4_Operand* barrierId);
+    void generateNamedBarrier(
+        G4_Predicate* prd, G4_Operand* barrierId, G4_SrcRegRegion* threadValue);
 
-    void generateNamedBarrier(G4_Operand* barrierId, G4_SrcRegRegion* threadValue);
+    ////////////////////////////////////////////////////////////////////////
+    // fence etc
 
-    void generateSingleBarrier();
-
-    int translateVISANamedBarrierWait(G4_Operand* barrierId);
-    int translateVISANamedBarrierSignal(G4_Operand* barrierId, G4_Operand* threadCount);
-
-    G4_INST* createFenceInstruction(
+    // this is the old fence op
+    // post-LSC platforms should use LSC fences
+    G4_INST* createFenceInstructionPreLSC(
+        G4_Predicate* prd,
         uint8_t flushParam, bool commitEnable, bool globalMemFence, bool isSendc);
 
-    G4_INST* createSLMFence();
+    G4_INST* createSLMFence(G4_Predicate* prd);
 
+    ////////////////////////////////////////////////////////////////////////
+    // other mem sync ops
     int translateVISAWaitInst(G4_Operand* mask);
-
-    void generateBarrierSend();
-    void generateBarrierWait();
 
     int translateVISASyncInst(ISA_Opcode opcode, unsigned int mask);
 
-    int translateVISASplitBarrierInst(bool isSignal);
+
 
     ///////////////////////////////////////////////////////////////////////////
     ///////////////////////////////////////////////////////////////////////////

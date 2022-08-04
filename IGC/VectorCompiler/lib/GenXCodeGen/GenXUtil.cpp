@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -30,7 +30,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Instructions.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Metadata.h"
@@ -292,7 +292,7 @@ llvm::Optional<unsigned> genx::getTwoAddressOperandNum(CallInst *CI)
   if (CI->getType()->isVoidTy())
     return None; // no return value
   GenXIntrinsicInfo II(IntrinsicID);
-  unsigned Num = CI->getNumArgOperands();
+  unsigned Num = IGCLLVM::getNumArgOperands(CI);
   if (!Num)
     return None; // no args
   --Num; // Num = last arg number, could be two address operand
@@ -2113,14 +2113,14 @@ unsigned genx::ceilLogAlignment(unsigned LogAlignment, unsigned GRFWidth) {
 bool genx::isWrPredRegionLegalSetP(const CallInst &WrPredRegion) {
   IGC_ASSERT_MESSAGE(GenXIntrinsic::getGenXIntrinsicID(&WrPredRegion) == GenXIntrinsic::genx_wrpredregion,
     "wrong argument: wrpredregion intrinsic was expected");
-  auto &NewValue = *WrPredRegion.getOperand(WrPredRegionOperand::NewValue);
+  auto &NewValue = *WrPredRegion.getOperand(vc::WrPredRegionOperand::NewValue);
   auto ExecSize =
       NewValue.getType()->isVectorTy()
           ? cast<IGCLLVM::FixedVectorType>(NewValue.getType())->getNumElements()
           : 1;
-  auto Offset =
-      cast<ConstantInt>(WrPredRegion.getOperand(WrPredRegionOperand::Offset))
-          ->getZExtValue();
+  auto Offset = cast<ConstantInt>(
+                    WrPredRegion.getOperand(vc::WrPredRegionOperand::Offset))
+                    ->getZExtValue();
   if (ExecSize >= 32 || !isPowerOf2_64(ExecSize))
     return false;
   if (ExecSize == 32)

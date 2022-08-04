@@ -35,6 +35,9 @@ namespace iga {
         Kernel(const Kernel &) = delete;
         Kernel& operator=(const Kernel&) = delete;
 
+        void              resetIds();
+        bool              checkIdsUnique() const;
+
         MemManager&       getMemManager() { return m_mem; }
         const Model&      getModel() const { return m_model; }
         const BlockList&  getBlockList() const { return m_blocks; }
@@ -88,6 +91,7 @@ namespace iga {
         Instruction *createSyncNopInstruction(SWSB sw);
         Instruction *createSyncAllRdInstruction(SWSB sw);
         Instruction *createSyncAllWrInstruction(SWSB sw);
+        Instruction* createInlineBinaryInstruction(const Instruction::InlineBinaryType& binary);
     private:
         const Model&                      m_model;
         MemManager                        m_mem;

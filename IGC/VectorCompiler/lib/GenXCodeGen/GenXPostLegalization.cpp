@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -26,8 +26,6 @@ SPDX-License-Identifier: MIT
 /// this pass.
 ///
 //===----------------------------------------------------------------------===//
-#define DEBUG_TYPE "GENX_POST_LEGALIZATION"
-
 #include "GenX.h"
 #include "GenXBaling.h"
 #include "GenXConstants.h"
@@ -47,11 +45,14 @@ SPDX-License-Identifier: MIT
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 
+#define DEBUG_TYPE "GENX_POST_LEGALIZATION"
+
 #include <set>
 
 using namespace llvm;
 using namespace genx;
 using namespace GenXIntrinsic::GenXRegion;
+using namespace vc;
 
 namespace {
 
@@ -152,4 +153,3 @@ bool GenXPostLegalization::runOnFunction(Function &F)
 
   return Modified;
 }
-

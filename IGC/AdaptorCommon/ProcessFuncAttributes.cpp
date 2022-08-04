@@ -18,6 +18,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 
 #include "llvm/IR/Attributes.h"
+#include "llvmWrapper/IR/InstrTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
 
 #include <llvm/Pass.h>
@@ -126,7 +127,7 @@ static void getContainedStructType(Type *T, SmallPtrSetImpl<StructType *> &Tys)
     }
     else if (auto PT = dyn_cast<PointerType>(T))
     {
-        return getContainedStructType(PT->getElementType(), Tys);
+        return getContainedStructType(PT->getPointerElementType(), Tys);
     }
     else if (auto AT = dyn_cast<ArrayType>(T))
     {
@@ -379,12 +380,12 @@ bool ProcessFuncAttributes::runOnModule(Module& M)
                 // Go through call sites and remove NoInline atrributes.
                 // Verifier fails if a call has optnone but not noinline, so if we remove noinline, we must also remove optnone
                 if (callInst->hasFnAttr(llvm::Attribute::NoInline)) {
-                    callInst->removeAttribute(AttributeList::FunctionIndex, llvm::Attribute::NoInline);
-                    callInst->removeAttribute(AttributeList::FunctionIndex, llvm::Attribute::OptimizeNone);
+                    IGCLLVM::removeFnAttr(callInst, llvm::Attribute::NoInline);
+                    IGCLLVM::removeFnAttr(callInst, llvm::Attribute::OptimizeNone);
                 }
                 // Remove AlwaysInline at callsites
                 if (isOptDisable && callInst->hasFnAttr(llvm::Attribute::AlwaysInline)) {
-                    callInst->removeAttribute(AttributeList::FunctionIndex, llvm::Attribute::AlwaysInline);
+                    IGCLLVM::removeFnAttr(callInst, llvm::Attribute::AlwaysInline);
                 }
             }
         }

@@ -16,14 +16,8 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/GenCodeGenModule.h"
 #include "Compiler/CISACodeGen/messageEncoding.hpp"
 #include "Compiler/CISACodeGen/VariableReuseAnalysis.hpp"
-#include "Compiler/CISACodeGen/PixelShaderCodeGen.hpp"
-#include "Compiler/CISACodeGen/VertexShaderCodeGen.hpp"
-#include "Compiler/CISACodeGen/GeometryShaderCodeGen.hpp"
-#include "Compiler/CISACodeGen/ComputeShaderCodeGen.hpp"
-#include "Compiler/CISACodeGen/HullShaderCodeGen.hpp"
-#include "Compiler/CISACodeGen/DomainShaderCodeGen.hpp"
 #include "Compiler/CISACodeGen/OpenCLKernelCodeGen.hpp"
-#include "Compiler/CISACodeGen/BindlessShaderCodeGen.hpp"
+#include "Compiler/CISACodeGen/VectorProcess.hpp"
 #include "Compiler/MetaDataApi/MetaDataApi.h"
 #include "common/secure_mem.h"
 #include "Probe/Assertion.h"
@@ -87,6 +81,7 @@ void CShader::InitEncoder(SIMDMode simdSize, bool canAbortOnSpill, ShaderDispatc
     m_CR0 = nullptr;
     m_CE0 = nullptr;
     m_DBG = nullptr;
+    m_MSG0 = nullptr;
     m_HW_TID = nullptr;
     m_SP = nullptr;
     m_FP = nullptr;
@@ -275,6 +270,40 @@ void CShader::EOTGateway(CVariable* payload)
 
 void CShader::AddEpilogue(llvm::ReturnInst* ret)
 {
+    if (IGC_IS_FLAG_ENABLED(deadLoopForFloatException))
+    {
+        // (W) mov (8|M0) t sr0.1<0;1,0>:ud
+        CVariable* t = GetNewVariable(
+            numLanes(m_SIMDSize),
+            ISA_TYPE_UW, EALIGN_WORD, "tmp_sr0_1");
+        encoder.SetNoMask();
+        encoder.SetSrcSubReg(0, 1);
+        CVariable* SR0 = GetNewVariable(4, ISA_TYPE_UW, EALIGN_WORD, true, CName::NONE);
+        encoder.GetVISAPredefinedVar(SR0, PREDEFINED_SR0);
+        encoder.Copy(t, SR0);
+        encoder.Push();
+
+        // (W) and (8|M0) t t 0x3F:uw
+        encoder.SetNoMask();
+        encoder.And(t, t, ImmToVariable(0x3F, ISA_TYPE_UW)); // sr0.1 bit 0~5 for float exception
+        encoder.Push();
+
+        // (W) cmp.ne (8|M0) f0.0  t:uw  0:uw
+        CVariable* lsPred = GetNewVariable(
+            numLanes(m_SIMDSize), ISA_TYPE_BOOL, EALIGN_BYTE, "pred_sr0");
+        encoder.SetNoMask();
+        encoder.Cmp(EPREDICATE_NE, lsPred, t, ImmToVariable(0, ISA_TYPE_UW));
+        encoder.Push();
+
+        // create loop label
+        uint label = encoder.GetNewLabelID("sr0_1_loop");
+        encoder.Label(label);
+        encoder.Push();
+
+        //(W&f0.0) jmpi     label
+        encoder.Jump(lsPred, label);
+        encoder.Push();
+    }
     encoder.EOT();
     encoder.Push();
 }
@@ -331,6 +360,10 @@ void CShader::RestoreStackState()
     encoder.Copy(m_FP, m_SavedFP);
     encoder.Push();
     m_SavedFP = nullptr;
+}
+
+void CShader::InitializeScratchSurfaceStateAddress()
+{
 }
 
 void CShader::CreateImplicitArgs()
@@ -601,7 +634,7 @@ void CShader::AllocateConstants(uint& offset)
         m_ConstantBufferLength += var->GetSize();
     }
 
-    m_ConstantBufferLength = iSTD::Align(m_ConstantBufferLength, getGRFSize());
+    m_ConstantBufferLength = iSTD::Align(m_ConstantBufferLength, getMinPushConstantBufferAlignmentInBytes());
     offset += m_ConstantBufferLength;
 }
 
@@ -630,7 +663,7 @@ void CShader::AllocateNOSConstants(uint& offset)
         maxConstantPushed = std::max(maxConstantPushed, I->first + numConstantsPushed);
     }
     maxConstantPushed = iSTD::Max(maxConstantPushed, static_cast<uint>(m_ModuleMetadata->MinNOSPushConstantSize));
-    m_NOSBufferSize = iSTD::Align(maxConstantPushed * SIZE_DWORD, getGRFSize());
+    m_NOSBufferSize = iSTD::Align(maxConstantPushed * SIZE_DWORD, getMinPushConstantBufferAlignmentInBytes());
     offset += m_NOSBufferSize;
 }
 
@@ -750,9 +783,9 @@ void CShader::MapPushedInputs()
 
 bool CShader::IsPatchablePS()
 {
-    return (GetShaderType() == ShaderType::PIXEL_SHADER &&
-        static_cast<CPixelShader*>(this)->GetPhase() != PSPHASE_PIXEL);
+    return false;
 }
+
 
 CVariable* CShader::GetR0()
 {
@@ -818,6 +851,17 @@ CVariable* CShader::GetDBG()
         encoder.GetVISAPredefinedVar(m_DBG, PREDEFINED_DBG);
     }
     return m_DBG;
+}
+
+CVariable* CShader::GetMSG0()
+{
+    if (!m_MSG0)
+    {
+        m_MSG0 = GetNewVariable(4, ISA_TYPE_UD, EALIGN_DWORD, true, CName::NONE);
+
+        encoder.GetVISAPredefinedVar(m_MSG0, PREDEFINED_MSG0);
+    }
+    return m_MSG0;
 }
 
 CVariable* CShader::GetHWTID()
@@ -1337,6 +1381,69 @@ uint CShader::GetNbVectorElementAndMask(llvm::Value* val, uint32_t& mask)
         {
             nbElement = iSTD::BitCount(mask);
         }
+    } else if (auto *LD = dyn_cast<LoadInst>(val)) {
+        do {
+            if (shouldGenerateLSC(LD))
+                break;
+            Value *Ptr = LD->getPointerOperand();
+            PointerType *PtrTy = cast<PointerType>(Ptr->getType());
+            bool useA32 = !IGC::isA64Ptr(PtrTy, GetContext());
+
+            Type* Ty = LD->getType();
+            IGCLLVM::FixedVectorType* VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty);
+            Type* eltTy = VTy ? VTy->getElementType() : Ty;
+            uint32_t eltBytes = GetScalarTypeSizeInRegister(eltTy);
+            // Skip if not 32-bit load.
+            if (eltBytes != 4)
+                break;
+
+            uint32_t elts = VTy ? int_cast<uint32_t>(VTy->getNumElements()) : 1;
+            uint32_t totalBytes = eltBytes * elts;
+
+            unsigned align = (unsigned)LD->getAlignment();
+
+            uint bufferIndex = 0;
+            bool directIndexing = false;
+            BufferType bufType = DecodeAS4GFXResource(PtrTy->getAddressSpace(), directIndexing, bufferIndex);
+            // Some driver describe constant buffer as typed which forces us to use
+            // byte scatter message.
+            bool forceByteScatteredRW = (bufType == CONSTANT_BUFFER) && UsesTypedConstantBuffer(GetContext(), bufType);
+
+            // Keep this check consistent in emitpass.
+            if (bufType == STATELESS_A32)
+                break;
+
+            // Keep this check consistent in emitpass.
+            if (totalBytes < 4)
+                break;
+
+            // Keep this check consistent in emitpass.
+            if (GetIsUniform(Ptr))
+                break;
+
+            VectorMessage VecMessInfo(this);
+            VecMessInfo.getInfo(Ty, align, useA32, forceByteScatteredRW);
+
+            // Skip if non-trival case or gather4 won't be used. So far, only
+            // VectorMessage::MESSAGE_A32_UNTYPED_SURFACE_RW is considered.
+            if (VecMessInfo.numInsts != 1 ||
+                VecMessInfo.insts[0].kind !=
+                    VectorMessage::MESSAGE_A32_UNTYPED_SURFACE_RW)
+                break;
+
+            for (auto *User : LD->users()) {
+                auto *EEI = dyn_cast<ExtractElementInst>(User);
+                auto *CI = EEI ? dyn_cast<ConstantInt>(EEI->getIndexOperand()) : nullptr;
+                if (!CI) {
+                    // Don't populate any mask so that default one could be used instead.
+                    mask = 0;
+                    break;
+                }
+                mask |= BIT(unsigned(CI->getZExtValue()));
+            }
+            if (mask)
+                nbElement = iSTD::BitCount(mask);
+        } while (0);
     }
     return nbElement;
 }
@@ -1804,8 +1911,9 @@ CVariable* CShader::GetStructVariable(llvm::Value* v, bool forceVectorInit)
     IGC_ASSERT_MESSAGE(isConstBase(v) ||
         isa<InsertValueInst>(v) ||
         isa<CallInst>(v) ||
-        isa<Argument>(v),
-        "Invalid struct symbol usage! Struct symbol should only come from const, insertvalue, call, or function arg");
+        isa<Argument>(v) ||
+        isa<PHINode>(v),
+        "Invalid instruction using struct type!");
 
     if (isa<InsertValueInst>(v))
     {
@@ -1839,10 +1947,10 @@ CVariable* CShader::GetStructVariable(llvm::Value* v, bool forceVectorInit)
             return it->second;
         }
     }
-    else
+    else if (isConstBase(v))
     {
         // Const cannot be mapped
-        IGC_ASSERT(isConstBase(v) && symbolMapping.find(v) == symbolMapping.end());
+        IGC_ASSERT(symbolMapping.find(v) == symbolMapping.end());
     }
 
     bool isUniform = forceVectorInit ? false : m_WI->isUniform(v);
@@ -3017,11 +3125,7 @@ CVariable* CShader::GetSymbol(llvm::Value* value, bool fromConstantPool)
             symbolMapping.insert(std::pair<Value*, CVariable*>(value, Alias));
             return Alias;
         }
-        if (genInst->getIntrinsicID() == GenISAIntrinsic::GenISA_UpdateDiscardMask)
-        {
-            IGC_ASSERT(GetShaderType() == ShaderType::PIXEL_SHADER);
-            return (static_cast<CPixelShader*>(this))->GetDiscardPixelMask();
-        }
+
     }
 
     if (m_coalescingEngine) {
@@ -3168,6 +3272,12 @@ bool CShader::CanTreatAsAlias(llvm::ExtractElementInst* inst)
         {
             return false;
         }
+        // If there is another component not being treated as alias, this
+        // component cannot be neither. This decision should be mitigated once
+        // the VISA could track the liveness of individual elements of vector
+        // variables.
+        if (IsCoalesced(extract))
+            return false;
     }
 
     return true;
@@ -3700,19 +3810,7 @@ bool CShader::CompileSIMDSizeInCommon(SIMDMode simdMode)
 
 uint32_t CShader::GetShaderThreadUsageRate()
 {
-    uint32_t grfNum = GRF_TOTAL_NUM;
-    if (IGC_GET_FLAG_VALUE(TotalGRFNum) != 0)
-    {
-        grfNum = IGC_GET_FLAG_VALUE(TotalGRFNum);
-    }
-    else if (GetContext()->hasSyncRTCalls() && IGC_GET_FLAG_VALUE(TotalGRFNum4RQ) != 0)
-    {
-        grfNum = IGC_GET_FLAG_VALUE(TotalGRFNum4RQ);
-    }
-    else if (GetContext()->type == ShaderType::COMPUTE_SHADER && IGC_GET_FLAG_VALUE(TotalGRFNum4CS) != 0)
-    {
-        grfNum = IGC_GET_FLAG_VALUE(TotalGRFNum4CS);
-    }
+    uint32_t grfNum = GetContext()->getNumGRFPerThread();
     // prevent callee divide by zero
     return std::max<uint32_t>(1, grfNum / GRF_TOTAL_NUM);
 }
@@ -3778,27 +3876,6 @@ CShader* CShaderProgram::CreateNewShader(SIMDMode simd)
         {
         case ShaderType::OPENCL_SHADER:
             pShader = new COpenCLKernel((OpenCLProgramContext*)m_context, m_kernel, this);
-            break;
-        case ShaderType::PIXEL_SHADER:
-            pShader = new CPixelShader(m_kernel, this);
-            break;
-        case ShaderType::VERTEX_SHADER:
-            pShader = new CVertexShader(m_kernel, this);
-            break;
-        case ShaderType::GEOMETRY_SHADER:
-            pShader = new CGeometryShader(m_kernel, this);
-            break;
-        case ShaderType::HULL_SHADER:
-            pShader = new CHullShader(m_kernel, this);
-            break;
-        case ShaderType::DOMAIN_SHADER:
-            pShader = new CDomainShader(m_kernel, this);
-            break;
-        case ShaderType::COMPUTE_SHADER:
-            pShader = new CComputeShader(m_kernel, this);
-            break;
-        case ShaderType::RAYTRACING_SHADER:
-            pShader = new CBindlessShader(m_kernel, this);
             break;
         default:
             IGC_ASSERT_MESSAGE(0, "wrong shader type");
@@ -3915,3 +3992,164 @@ bool CShader::needsEntryFence() const
     }
     return false;
 }
+
+bool CShader::forceCacheCtrl(llvm::Instruction* inst)
+{
+    std::map<uint32_t, uint32_t> list = m_ModuleMetadata->forceLscCacheList;
+    unsigned calleeArgNo = 0;
+    PushInfo& pushInfo = m_ModuleMetadata->pushInfo;
+    Value* src = IGC::TracePointerSource(inst->getOperand(0));
+    if (src)
+    {
+        if (Argument * calleeArg = dyn_cast<Argument>(src))
+        {
+            calleeArgNo = calleeArg->getArgNo();
+            for (auto index_it = pushInfo.constantReg.begin(); index_it != pushInfo.constantReg.end(); ++index_it)
+            {
+                if (index_it->second == calleeArgNo)
+                {
+                    auto pos = list.find(index_it->first);
+                    if (pos != list.end()) {
+                        MDNode* node = MDNode::get(
+                            inst->getContext(),
+                            ConstantAsMetadata::get(
+                                ConstantInt::get(Type::getInt32Ty(inst->getContext()), pos->second)));
+                        inst->setMetadata("lsc.cache.ctrl", node);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// This function may be used in earlier passes to determine whether a given
+// instruction will generate an LSC message. If it returns Unknown or False, you
+// should conservatively assume that you don't know what will be generated. If
+// this returns True, it is guaranteed that an LSC message will result.
+Tristate CShader::shouldGenerateLSCQuery(
+    const CodeGenContext& Ctx,
+    Instruction* vectorLdStInst,
+    SIMDMode Mode)
+{
+    auto& Platform   = Ctx.platform;
+    auto& DriverInfo = Ctx.m_DriverInfo;
+
+    if (!Platform.LSCEnabled(Mode)) {
+        // We enable LSC load/store only when program SIMD size is >= LSC's
+        // simd size.  This is to avoid increasing register pressure and
+        // reduce extra moves.
+        // Note, that this only applies to gather/scatter;
+        // for blocked messages we can always enable LSC
+        return Tristate::False;
+    }
+
+    // Geneate LSC for load/store instructions as Load/store emit can
+    // handle full-payload uniform non-transpose LSC on PVC A0.
+    if (vectorLdStInst == nullptr
+        || isa<LoadInst>(vectorLdStInst)
+        || isa<StoreInst>(vectorLdStInst))
+        return Tristate::True;
+    // special checks for typed r/w
+    if (GenIntrinsicInst* inst = dyn_cast<GenIntrinsicInst>(vectorLdStInst))
+    {
+        if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedread ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_intatomictyped ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_icmpxchgatomictyped)
+        {
+            return (Platform.hasLSCTypedMessage() ? Tristate::True : Tristate::False);
+        }
+        else if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_ldraw_indexed ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_ldrawvector_indexed ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_storeraw_indexed ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_storerawvector_indexed)
+        {
+            IGC_ASSERT(Platform.isProductChildOf(IGFX_DG2));
+            IGC_ASSERT(Platform.hasLSC());
+
+            bool Result =
+                DriverInfo.EnableLSCForLdRawAndStoreRawOnDG2() ||
+                Platform.isCoreChildOf(IGFX_XE_HPC_CORE);
+
+            return (Result ? Tristate::True : Tristate::False);
+        }
+    }
+
+    // in PVC A0, SIMD1 reads/writes need full payloads
+    // this causes chaos for vISA (would need 4REG alignment)
+    // and to make extra moves to enable the payload
+    // B0 gets this feature (there is no A1)
+    if (!Platform.LSCSimd1NeedFullPayload()) {
+        return Tristate::True;
+    }
+
+    return Tristate::Unknown;
+}
+
+// Note that if LSCEnabled() returns true, load/store instructions must be
+// generated with LSC; but some intrinsics are still generated with legacy.
+bool CShader::shouldGenerateLSC(llvm::Instruction* vectorLdStInst)
+{
+    if (vectorLdStInst && m_ctx->m_DriverInfo.SupportForceRouteAndCache())
+    {
+        // check if umd specified lsc caching mode and set the metadata if needed.
+        if (forceCacheCtrl(vectorLdStInst))
+        {
+            // if umd force the caching mode, also assume it wants the resource to be in lsc.
+            return true;
+        }
+    }
+
+    if (auto result = shouldGenerateLSCQuery(*m_ctx, vectorLdStInst, m_SIMDSize);
+        result != Tristate::Unknown)
+        return (result == Tristate::True);
+
+    // ensure both source and destination are not uniform
+    Value* addrs = nullptr;
+    if (GenIntrinsicInst * inst = dyn_cast<GenIntrinsicInst>(vectorLdStInst)) {
+        addrs = inst->getOperand(0); // operand 0 is always addr for loads and stores
+    } // else others?
+
+    // we can generate LSC only if it's not uniform (SIMD1) or A32
+    bool canGenerate = true;
+    if (addrs) {
+        bool isA32 = false; // TODO: see below
+        if (PointerType * ptrType = dyn_cast<PointerType>(addrs->getType())) {
+            isA32 = !IGC::isA64Ptr(ptrType, GetContext());
+        }
+        canGenerate &= isA32 || !GetSymbol(addrs)->IsUniform();
+
+        if (!isA32 && GetSymbol(addrs)->IsUniform()) {
+            // This is A64 and Uniform case. The LSC is not allowed.
+            // However, before exit check the total bytes to be stored or loaded.
+            if (totalBytesToStoreOrLoad(vectorLdStInst) >= 4) {
+                canGenerate = true;
+            }
+        }
+    }
+    return canGenerate;
+} // shouldGenerateLSC
+
+uint32_t CShader::totalBytesToStoreOrLoad(llvm::Instruction* vectorLdStInst)
+{
+    if (dyn_cast<LoadInst>(vectorLdStInst) || dyn_cast<StoreInst>(vectorLdStInst)) {
+        Type* Ty = nullptr;
+        if (LoadInst * inst = dyn_cast<LoadInst>(vectorLdStInst)) {
+            Ty = inst->getType();
+        }
+        else if (StoreInst * inst = dyn_cast<StoreInst>(vectorLdStInst)) {
+            Value* storedVal = inst->getValueOperand();
+            Ty = storedVal->getType();
+        }
+        if (Ty) {
+            IGCLLVM::FixedVectorType* VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty);
+            Type* eltTy = VTy ? VTy->getElementType() : Ty;
+            uint32_t eltBytes = GetScalarTypeSizeInRegister(eltTy);
+            uint32_t elts = VTy ? int_cast<uint32_t>(VTy->getNumElements()) : 1;
+            return (eltBytes * elts);
+        }
+    }
+    return 0;
+} // totalBytesToStoreOrLoad

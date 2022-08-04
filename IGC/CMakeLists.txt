@@ -53,6 +53,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/BiFModule/cmake)
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules)
 
 include(igc_flags_utils)
@@ -208,6 +209,17 @@ set_source_files_properties(${IGC_CODEGEN_DIR}/MDNodeFunctions.gen PROPERTIES GE
 # ============================================================================
 # The section must be after project definition and its supported languages because otherwise
 # used variables are not available yet.
+
+# Generate debug symbols even in release mode, thus making it possible to produce
+# separate Debian/RPM debug information packages.
+# FIXME: Instead of hacking the release build flags, consider using CMake's
+# RelWithDebInfo build type.
+if(UNIX)
+  set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -g")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g")
+  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -g")
+  set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -g")
+endif()
 
 
 # Populating global property with list of debug configurations (based on pattern).
@@ -1298,6 +1310,7 @@ include(igc_llvm)
 
 # ==================================== LLD package ====================================================
 
+message(STATUS "[lld] option = ${IGC_OPTION__LLVM_LLD}")
 if(IGC_OPTION__LLVM_LLD)
   include(igc_find_liblldELF)
 endif()
@@ -1657,6 +1670,7 @@ foreach(_libBuildSuffix ${IGC_BUILD__MAIN_IGC_LIB_SUFFIXES})
 
   if(MSVC AND IGC_OPTION__BIF_LINK_BC)
     add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"   "${IGC_BUILD__PROJ__BiFModule_OCL}")
+    add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"   "${IGC_BUILD__PROJ__BiFModuleCache_OCL}")
     add_dependencies("${IGC_BUILD__PROJ${_libBuildSuffix}}"   "${IGC_BUILD__PROJ__ElfPackager}")
   endif()
 endforeach()
@@ -1890,9 +1904,8 @@ endif()
 
 # ============================================== LIT TESTS =============================================
 
-add_subdirectory(Compiler/tests)
-if(TARGET "check-igc")
-  add_dependencies("${IGC_BUILD__PROJ__igc_dll}" "check-igc")
+if(DEFINED IGC_BUILD__PROJ__igc_opt AND TARGET ${IGC_BUILD__PROJ__igc_opt})
+  add_subdirectory(Compiler/tests)
 endif()
 
 
@@ -2060,6 +2073,11 @@ if(UNIX)
   set(CPACK_ARCHIVE_IGC-OPENCL_FILE_NAME "intel-igc-opencl-${CPACK_PACKAGE_VERSION}.${CPACK_PACKAGE_ARCHITECTURE}")
   set(CPACK_ARCHIVE_IGC-OPENCL-DEVEL_FILE_NAME "intel-igc-opencl-devel-${CPACK_PACKAGE_VERSION}.${CPACK_PACKAGE_ARCHITECTURE}")
 
+  # Create separate debug symbol packages if the CMake/CPack version in use
+  # provides stable support for that functionality.
+  if (NOT CMAKE_VERSION VERSION_LESS 3.20)
+    set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)
+  endif()
   set(CPACK_DEB_COMPONENT_INSTALL ON)
   set(CPACK_RPM_COMPONENT_INSTALL ON)
   set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)

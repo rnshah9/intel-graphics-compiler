@@ -51,3 +51,14 @@ if int(config.llvm_version) < 11:
   config.substitutions.append(('%enable-basic-aa%', '-basicaa'))
 else:
   config.substitutions.append(('%enable-basic-aa%', '--basic-aa'))
+# Add LLVM version-dependent check prefixes.
+# FIXME: Remove altogether after unifying all supported LLVM versions at 14+.
+if int(config.llvm_version) < 14:
+  config.substitutions.append(('%LLVM_DEPENDENT_CHECK_PREFIX%', 'CHECK-PRE-LLVM-14'))
+else:
+  config.substitutions.append(('%LLVM_DEPENDENT_CHECK_PREFIX%', 'CHECK-LLVM-14-PLUS'))
+
+if config.use_khronos_spirv_translator_in_sc == "1":
+  config.substitutions.append(('%SPV_CHECK_PREFIX%', 'CHECK-KHR'))
+else:
+  config.substitutions.append(('%SPV_CHECK_PREFIX%', 'CHECK-LEGACY'))

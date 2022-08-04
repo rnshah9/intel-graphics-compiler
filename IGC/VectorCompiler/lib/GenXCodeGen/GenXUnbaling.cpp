@@ -254,8 +254,6 @@ SPDX-License-Identifier: MIT
 /// copy coalesced together anyway.
 ///
 //===----------------------------------------------------------------------===//
-#define DEBUG_TYPE "GENX_UNBALING"
-
 #include "FunctionGroup.h"
 #include "GenX.h"
 #include "GenXBaling.h"
@@ -281,6 +279,8 @@ SPDX-License-Identifier: MIT
 #include "Probe/Assertion.h"
 
 #include "llvmWrapper/IR/DerivedTypes.h"
+
+#define DEBUG_TYPE "GENX_UNBALING"
 
 using namespace llvm;
 using namespace genx;
@@ -438,8 +438,9 @@ bool canBeSafelyHoisted(Instruction *Inst, Instruction *InsertBefore) {
   // handling only cases, where U is a Constant/Declaration/etc
   auto IsDefinedAtInsertPoint = [](Value *V) { return !isa<Instruction>(V); };
 #else
-  IGC_ASSERT_MESSAGE(InsertBefore->comesBefore(Inst),
-                     "InsertBefore must come before Inst in IR");
+  // InsertBefore must come before Inst in IR
+  if (!InsertBefore->comesBefore(Inst))
+    return false;
   auto IsDefinedAtInsertPoint = [InsertBefore](Value *V) {
     return !isa<Instruction>(V) ||
            cast<Instruction>(V)->comesBefore(InsertBefore);

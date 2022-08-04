@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021 Intel Corporation
+Copyright (C) 2021-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -56,6 +56,9 @@ int __cm_cl_printf_format_index(__global const char *str);
 //        switch to using addrspaces.
 int __cm_cl_printf_format_index(__private const char *str);
 
+template <int width> bool __cm_cl_all(vector_impl<char, width> src);
+template <int width> bool __cm_cl_any(vector_impl<char, width> src);
+
 uint32_t __cm_cl_lzd(uint32_t src);
 template <int width>
 vector_impl<uint32_t, width> __cm_cl_lzd(vector_impl<uint32_t, width> src);
@@ -82,6 +85,7 @@ template <typename T> T __cm_cl_abs_float(T src);
 template <typename T> T __cm_cl_ceil(T src);
 template <typename T> T __cm_cl_floor(T src);
 template <typename T> T __cm_cl_trunc(T src);
+template <typename T> T __cm_cl_roundne(T src);
 
 template <typename T> T __cm_cl_minnum(T src0, T src1);
 template <typename T> T __cm_cl_maxnum(T src0, T src1);
@@ -92,6 +96,8 @@ template <typename T> T __cm_cl_exp2(T src, bool use_fast);
 template <typename T> T __cm_cl_powr(T src0, T src1, bool use_fast);
 template <typename T> T __cm_cl_sin(T src, bool use_fast);
 template <typename T> T __cm_cl_cos(T src, bool use_fast);
+
+template <typename T> T __cm_cl_rsqrt(T src);
 
 vector_impl<uint32_t, 3> __cm_cl_local_id();
 vector_impl<uint32_t, 3> __cm_cl_local_size();
@@ -329,6 +335,12 @@ template <typename T> T trunc(T src) {
   static_assert(cl::is_floating_point<T>::value,
                 "Trunc function expects floating poing type.");
   return __cm_cl_trunc(src);
+}
+
+template <typename T> T roundne(T src) {
+  static_assert(cl::is_floating_point<T>::value,
+    "Roundne function expects floating poing type.");
+  return __cm_cl_roundne(src);
 }
 
 template <typename T> T min_float(T src0, T src1) {

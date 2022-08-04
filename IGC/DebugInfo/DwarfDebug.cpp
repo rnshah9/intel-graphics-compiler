@@ -2885,6 +2885,25 @@ void DwarfDebug::emitDebugMacInfo() {
   }
 }
 
+void DwarfDebug::encodeScratchAddrSpace(std::vector<uint8_t> &data) {
+  if (!EmitSettings.EnableGTLocationDebugging) {
+    Address addr;
+    addr.Set(Address::Space::eScratch, 0, 0);
+
+    write(data, (uint8_t)llvm::dwarf::DW_OP_const8u);
+    write(data, (uint64_t)addr.GetAddress());
+
+    write(data, (uint8_t)llvm::dwarf::DW_OP_or);
+  } else {
+    uint32_t scratchBaseAddrEncoded =
+        GetEncodedRegNum<RegisterNumbering::ScratchBase>(dwarf::DW_OP_breg0);
+
+    write(data, (uint8_t)scratchBaseAddrEncoded);
+    writeULEB128(data, 0);
+    write(data, (uint8_t)llvm::dwarf::DW_OP_plus);
+  }
+}
+
 uint32_t DwarfDebug::writeSubroutineCIE() {
   std::vector<uint8_t> data;
   auto numGRFs = GetVISAModule()->getNumGRFs();
@@ -3023,14 +3042,24 @@ uint32_t DwarfDebug::writeStackcallCIE() {
 
   // The DW_CFA_def_cfa_expression instruction takes a single operand
   // encoded as a DW_FORM_exprloc.
-  write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
   auto DWRegEncoded = GetEncodedRegNum<RegisterNumbering::GRFBase>(specialGRF);
-  writeULEB128(data1, DWRegEncoded);
+  if (!getEmitterSettings().EnableGTLocationDebugging) {
+    write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
+    writeULEB128(data1, DWRegEncoded);
+  } else {
+    write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
+    write(data1, (uint32_t)(DWRegEncoded));
+  }
   write(data1, (uint8_t)llvm::dwarf::DW_OP_const2u);
   write(data1, (uint16_t)(BEFPSubReg * 4 * 8));
-  write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
-  write(data1, (uint8_t)32);
-  write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
+  if (!getEmitterSettings().EnableGTLocationDebugging) {
+    write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
+    write(data1, (uint8_t)32);
+    write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
+  } else {
+    write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
+    write(data1, (uint8_t)32);
+  }
 
   if (EmitSettings.ScratchOffsetInOW) {
     // when scratch offset is in OW, be_fp has to be multiplied by 16
@@ -3042,22 +3071,7 @@ uint32_t DwarfDebug::writeStackcallCIE() {
   }
 
   // indicate that the resulting address is on BE stack
-  if (!EmitSettings.EnableGTLocationDebugging) {
-    Address addr;
-    addr.Set(Address::Space::eScratch, 0, 0);
-
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_const8u);
-    write(data1, (uint64_t)addr.GetAddress());
-
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_or);
-  } else {
-    uint32_t scratchBaseAddrEncoded =
-        GetEncodedRegNum<RegisterNumbering::ScratchBase>(dwarf::DW_OP_breg0);
-
-    write(data1, (uint8_t)scratchBaseAddrEncoded);
-    writeULEB128(data, 0);
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_plus);
-  }
+  encodeScratchAddrSpace(data1);
 
   writeULEB128(data, data1.size());
   for (auto item : data1)
@@ -3253,13 +3267,23 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
 
     auto DWRegEncoded =
         GetEncodedRegNum<RegisterNumbering::GRFBase>(specialGRF);
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
-    writeULEB128(data1, DWRegEncoded);
+    if (!getEmitterSettings().EnableGTLocationDebugging) {
+      write(data1, (uint8_t)llvm::dwarf::DW_OP_regx);
+      writeULEB128(data1, DWRegEncoded);
+    } else {
+      write(data1, (uint8_t)llvm::dwarf::DW_OP_const4u);
+      write(data1, (uint32_t)(DWRegEncoded));
+    }
     write(data1, (uint8_t)llvm::dwarf::DW_OP_const2u);
     write(data1, (uint16_t)(BEFPSubReg * 4 * 8));
-    write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
-    write(data1, (uint8_t)32);
-    write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
+    if (!getEmitterSettings().EnableGTLocationDebugging) {
+      write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
+      write(data1, (uint8_t)32);
+      write(data1, (uint8_t)DW_OP_INTEL_push_bit_piece_stack);
+    } else {
+      write(data1, (uint8_t)DW_OP_INTEL_regval_bits);
+      write(data1, (uint8_t)32);
+    }
 
     if (EmitSettings.ScratchOffsetInOW) {
       // when scratch offset is in OW, be_fp has to be multiplied by 16
@@ -3275,22 +3299,7 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
     write(data1, (uint8_t)llvm::dwarf::DW_OP_plus);
 
     // indicate that the resulting address is on BE stack
-    if (!EmitSettings.EnableGTLocationDebugging) {
-      Address addr;
-      addr.Set(Address::Space::eScratch, 0, 0);
-
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_const8u);
-      write(data1, (uint64_t)addr.GetAddress());
-
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_or);
-    } else {
-      uint32_t scratchBaseAddrEncoded =
-          GetEncodedRegNum<RegisterNumbering::ScratchBase>(dwarf::DW_OP_breg0);
-
-      write(data1, (uint8_t)scratchBaseAddrEncoded);
-      writeULEB128(data1, 0);
-      write(data1, (uint8_t)llvm::dwarf::DW_OP_plus);
-    }
+    encodeScratchAddrSpace(data1);
 
     if (deref) {
       write(data1, (uint8_t)llvm::dwarf::DW_OP_deref);
@@ -3308,6 +3317,12 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
       write(data1, (uint8_t)llvm::dwarf::DW_OP_const1u);
       write(data1, (uint8_t)16);
       write(data1, (uint8_t)llvm::dwarf::DW_OP_mul);
+    }
+
+    if (deref) {
+      // DW_OP_deref earlier causes CFA to be put on top of dwarf stack.
+      // Indicate that the address space of CFA is scratch.
+      encodeScratchAddrSpace(data1);
     }
 
     writeULEB128(data, data1.size());

@@ -409,7 +409,10 @@ void ConstantCoalescing::ProcessBlock(
             break;
         }
     }
-    bool skipLdrawOpt = (m_ctx->type == ShaderType::PIXEL_SHADER) || bbHasStores;
+
+    bool isCPS = false;
+
+    bool skipLdrawOpt = isCPS || bbHasStores;
     // get work-item analysis, need to update uniformness information
     for (BasicBlock::iterator BBI = blk->begin(), BBE = blk->end();
          BBI != BBE; ++BBI)
@@ -1162,7 +1165,7 @@ uint ConstantCoalescing::GetAlignment(Instruction* load) const
 
     if (isa<LoadInst>(load))
     {
-        alignment = cast<LoadInst>(load)->getAlignment();
+        alignment = (uint)cast<LoadInst>(load)->getAlignment();
     }
     else
     {
@@ -1585,7 +1588,7 @@ bool ConstantCoalescing::DecomposePtrExp(
     {
         // get the int-type address computation
         auto* expr = dyn_cast<Instruction>(i2p->getOperand(0));
-        if (!expr || !expr->getType()->isIntegerTy())
+        if (expr == nullptr || !(expr->getType()->isIntegerTy()))
         {
             return false;
         }

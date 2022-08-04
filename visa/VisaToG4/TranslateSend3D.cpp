@@ -1865,7 +1865,8 @@ int IR_Builder::translateVISASampler3DInst(
     bool simd16HFReturn = FP16Return && execSize == 16;
     if (needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi, needHeaderForChannels,
         isBindlessSampler(sampler),
-        simd16HFReturn))
+        simd16HFReturn) ||
+        samplerHeaderPreemptionWA())
     {
         useHeader = true;
         ++numRows;
@@ -1910,7 +1911,7 @@ int IR_Builder::translateVISASampler3DInst(
     // Collect header if present.
     if (header) {
         sources[i].opnd = header;
-        sources[i].execSize = g4::SIMD8;
+        sources[i].numElts = g4::SIMD8;
         sources[i].instOpt = InstOpt_WriteEnable | dbgOpt;
         ++i;
     }
@@ -1919,7 +1920,7 @@ int IR_Builder::translateVISASampler3DInst(
     unsigned uPos = needNoMask ? getUPosition(actualop) : ~0u;
     for (unsigned j = 0; j != numParms; ++j) {
         sources[i].opnd = params[j];
-        sources[i].execSize = execSize;
+        sources[i].numElts = execSize;
         sources[i].instOpt = (needNoMask && (uPos <= j && j < (uPos + 3))) ?
             InstOpt_WriteEnable | dbgOpt : instOpt | dbgOpt;
         ++i;
@@ -2035,7 +2036,7 @@ int IR_Builder::translateVISALoad3DInst(
     // Collect header if present.
     if (header) {
         sources[i].opnd = header;
-        sources[i].execSize = g4::SIMD8;
+        sources[i].numElts = g4::SIMD8;
         sources[i].instOpt = InstOpt_WriteEnable;
         ++i;
     }
@@ -2044,7 +2045,7 @@ int IR_Builder::translateVISALoad3DInst(
     unsigned uPos = needNoMask ? getUPosition(actualop) : ~0u;
     for (unsigned j = 0; j != numParms; ++j) {
         sources[i].opnd = opndArray[j];
-        sources[i].execSize = execSize;
+        sources[i].numElts = execSize;
         sources[i].instOpt = (needNoMask && (uPos <= j && j < (uPos + 3))) ?
             InstOpt_WriteEnable : instOpt;
         ++i;
@@ -2119,7 +2120,8 @@ int IR_Builder::translateVISAGather3dInst(
 
     if (needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi, needHeaderForChannels,
         isBindlessSampler(sampler),
-        simd16HFReturn))
+        simd16HFReturn) ||
+        samplerHeaderPreemptionWA())
     {
         useHeader = true;
         ++numRows;
@@ -2163,7 +2165,7 @@ int IR_Builder::translateVISAGather3dInst(
     // Collect header if present.
     if (header) {
         sources[i].opnd = header;
-        sources[i].execSize = g4::SIMD8;
+        sources[i].numElts = g4::SIMD8;
         sources[i].instOpt = InstOpt_WriteEnable;
         ++i;
     }
@@ -2172,7 +2174,7 @@ int IR_Builder::translateVISAGather3dInst(
     unsigned uPos = needNoMask ? getUPosition(actualop) : ~0u;
     for (unsigned j = 0; j != numOpnds; ++j) {
         sources[i].opnd = opndArray[j];
-        sources[i].execSize = execSize;
+        sources[i].numElts = execSize;
         sources[i].instOpt = (needNoMask && (uPos <= j && j < (uPos + 3))) ?
             InstOpt_WriteEnable : instOpt;
         ++i;

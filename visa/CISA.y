@@ -65,7 +65,7 @@ static bool ParseEMask(const char* sym, VISA_EMask_Ctrl &emask);
 
 std::deque<const char*> switchLabels;
 char * switch_label_array[32];
-std::vector<VISA_opnd*> RTRWOperands;
+std::vector<VISA_opnd*> RTRWOperandsVec;
 int num_parameters;
 
 VISA_RawOpnd* rawOperandArray[16];
@@ -443,7 +443,7 @@ std::vector<attr_gen_struct*> AttrOptVar;
 %type <string> RTWriteModeOpt
 
 %type <intval> SwitchLabels
-%type <intval> RTWriteOperandParse
+%type <intval> RTWriteOperands
 
 %type <pred_reg>   Predicate
 %type <pred_sign>  PredSign
@@ -1310,8 +1310,10 @@ SampleInstruction:
            $5, $6, $7, $8, CISAlineno));
    }
 
+Sample3dInstruction: Sample3DInstruction
+
            //        1         2            3                      4            5                          6               7        8                     9   10  11
-Sample3dInstruction: Predicate SAMPLE_3D_OP PixelNullMaskEnableOpt CPSEnableOpt NonUniformSamplerEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
+Sample3DInstruction: Predicate SAMPLE_3D_OP PixelNullMaskEnableOpt CPSEnableOpt NonUniformSamplerEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
            //        12
                      RawOperandArray
    {
@@ -1322,6 +1324,9 @@ Sample3dInstruction: Predicate SAMPLE_3D_OP PixelNullMaskEnableOpt CPSEnableOpt 
 
     ABORT_ON_FAIL(success);
    }
+
+
+
 
 CPSEnableOpt: %empty {$$ = false;} | CPS  {$$ = true;}
 
@@ -1340,8 +1345,10 @@ Load3dInstruction: Predicate LOAD_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL E
     ABORT_ON_FAIL(success);
    }
 
+Gather43dInstruction: Gather43DInstruction
+
            //         1         2             3                      4               5        6                     7   8   9
-Gather43dInstruction: Predicate SAMPLE4_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
+Gather43DInstruction: Predicate SAMPLE4_3D_OP PixelNullMaskEnableOpt SAMPLER_CHANNEL ExecSize VecSrcOperand_G_I_IMM Var Var RawOperand
            //      10
                    RawOperandArray
    {
@@ -1352,6 +1359,7 @@ Gather43dInstruction: Predicate SAMPLE4_3D_OP PixelNullMaskEnableOpt SAMPLER_CHA
 
     ABORT_ON_FAIL(success);
    }
+
 
 PixelNullMaskEnableOpt: %empty {$$ = false;} | PIXEL_NULL_MASK {$$ = true;}
 
@@ -1371,28 +1379,33 @@ SampleInfo3dInstruction: SAMPLEINFO_OP_3D   SAMPLER_CHANNEL  ExecSize    Var    
             ChannelMask::createFromAPI($2), $4, NULL, $5, CISAlineno));
    }
 
-RTWriteOperandParse:
+RTWriteOperands:
     %empty
     {
     }
-    | RTWriteOperandParse VecSrcOperand_G_IMM
+    | RTWriteOperands VecSrcOperand_G_IMM
     {
-        RTRWOperands.push_back($2.cisa_gen_opnd);
+        RTRWOperandsVec.push_back($2.cisa_gen_opnd);
     }
-    | RTWriteOperandParse RawOperand
+    | RTWriteOperands RawOperand
     {
-        RTRWOperands.push_back($2);
+        RTRWOperandsVec.push_back($2);
     }
+
+RTWriteInstruction: RTWInstruction
+
             //      1            2                3                 4           5     6
-RTWriteInstruction: Predicate    RTWRITE_OP_3D    RTWriteModeOpt    ExecSize    Var   RTWriteOperandParse
+RTWInstruction: Predicate    RTWRITE_OP_3D    RTWriteModeOpt    ExecSize    Var
+              RTWriteOperands
    {
        bool result = pBuilder->CISA_create_rtwrite_3d_instruction(
            $1, $3, $4.emask, (unsigned int)$4.exec_size, $5,
-           RTRWOperands, CISAlineno);
-       RTRWOperands.clear();
+           RTRWOperandsVec, CISAlineno);
+       RTRWOperandsVec.clear();
        if (!result)
            YYABORT; // already reported
    }
+
 
 RTWriteModeOpt: %empty {$$ = 0;} | RTWRITE_OPTION
 
@@ -2128,8 +2141,8 @@ BranchInstruction: Predicate BRANCH_OP ExecSize IdentOrStringLit
         $1, $3.emask, $3.exec_size,
         $4.cisa_gen_opnd, (unsigned)$5, (unsigned)$6, CISAlineno);
     }
-    // 1       2          3
-    | FADDR  IDENT VecDstOperand_G_I
+    // 1      2                3
+    | FADDR  IdentOrStringLit VecDstOperand_G_I
     {
         pBuilder->CISA_create_faddr_instruction($2, $3.cisa_gen_opnd, CISAlineno);
     }

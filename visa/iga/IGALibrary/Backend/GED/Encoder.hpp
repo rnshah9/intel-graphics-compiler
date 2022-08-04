@@ -200,6 +200,7 @@ namespace iga
         void encodeSendDescsXeHP(const Instruction& inst);
         void encodeSendDescsXeHPG(const Instruction& inst);
 
+        void encodeInlineBinaryInst(Instruction& inst);
         ///////////////////////////////////////////////////////////////////////
         // SYNC INSTRUCTIONS
         ///////////////////////////////////////////////////////////////////////
@@ -286,6 +287,7 @@ namespace iga
                 value = val.u64;
                 break;
             case Type::BF8:
+            case Type::HF8:
                 value = (uint64_t)val.u8;
                 break;
             case Type::TF32:
@@ -306,6 +308,7 @@ namespace iga
             case Type::HF:
             case Type::BF:
             case Type::BF8:
+            case Type::HF8:
             case Type::TF32:
             case Type::F:
             case Type::DF:

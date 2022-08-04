@@ -393,7 +393,6 @@ protected:
     // during optimization, an inst may become redundant and be marked dead
     unsigned short dead : 1;
     unsigned short evenlySplitInst : 1;
-    unsigned short skipPostRA : 1;  // for NoMaskWA; to be deleted
     unsigned short doPostRA : 1;  // for NoMaskWA
     unsigned short canBeAcc : 1; //The inst can be ACC, including the inst's dst and the use operands in the DU chain.
     G4_ExecSize    execSize;
@@ -515,6 +514,22 @@ public:
     { }
 
     G4_INST(
+        const IR_Builder& irb,
+        G4_Predicate* prd,
+        G4_opcode o,
+        G4_CondMod* m,
+        G4_Sat s,
+        G4_ExecSize size,
+        G4_DstRegRegion* d,
+        G4_Operand* s0,
+        G4_Operand* s1,
+        G4_Operand* s2,
+        G4_Operand* s3,
+        G4_InstOpts opt)
+    : G4_INST(irb, prd, o, m, s, size, d, s0, s1, s2, s3, nullptr, opt)
+    { }
+
+    G4_INST(
         const IR_Builder& builder,
         G4_Predicate* prd,
         G4_opcode o,
@@ -526,6 +541,7 @@ public:
         G4_Operand* s1,
         G4_Operand* s2,
         G4_Operand* s3,
+        G4_Operand* s4,
         G4_InstOpts opt);
 
     virtual ~G4_INST()
@@ -555,6 +571,8 @@ public:
 
     G4_DstRegRegion* getDst() const { return dst; }
     bool supportsNullDst() const;
+
+    void setAccurateDistType(SB_INST_PIPE depPipe);
 
     bool isPseudoKill() const;
     bool isLifeTimeEnd() const;
@@ -822,7 +840,6 @@ public:
     bool isNoDDChkInst()   const { return (option & InstOpt_NoDDChk)    ? true : false; }
     bool isNoDDClrInst()   const { return (option & InstOpt_NoDDClr)    ? true : false; }
     bool isBreakPointInst() const { return (option & InstOpt_BreakPoint) ? true : false; }
-
     // true if inst reads/writes acc either implicitly or explicitly
     bool useAcc() const
     {
@@ -844,7 +861,9 @@ public:
     void setEvenlySplitInst(bool val) { evenlySplitInst = val; }
     bool getEvenlySplitInst() { return evenlySplitInst; }
 
-    void setCISAOff(int offset) { srcCISAoff = offset; }
+    void setCISAOff(int offset) {
+        srcCISAoff = offset;
+    }
     int getCISAOff() const { return srcCISAoff; }
     bool isCISAOffValid() const { return getCISAOff() != UndefinedCisaOffset; }
 
@@ -1054,6 +1073,7 @@ public:
     bool canSwapSource() const;
     bool canSupportSaturate() const;
     bool canSupportSrcModifier() const;
+    bool isSamePrePostConds() const;
 
     bool writesFlag() const;
 
@@ -1148,10 +1168,7 @@ public:
     // prefer addComment if don't wish to stomp earlier comments
     void setComments(const std::string& comments);
 
-    // For NoMaskWA. Set in PreRA WA for all instructions. PostRA WA will
-    // apply on new instructions created by RA only.
-    bool getSkipPostRA() const { return skipPostRA; }
-    void setSkipPostRA(bool V) { skipPostRA = V; }
+    // For NoMaskWA. If set, it needs WA.
     bool getNeedPostRA() const { return doPostRA; }
     void setNeedPostRA(bool V) { doPostRA = V; }
 
@@ -1517,6 +1534,7 @@ public:
         G4_Operand* extDesc,
         G4_InstOpts opt,
         G4_SendDesc* md);
+
 
     G4_INST* cloneInst() override;
 
@@ -2325,6 +2343,7 @@ public:
     virtual bool isRelocImm() const { return false; }
     virtual void emit(std::ostream &output, bool symbolreg = false) = 0;
     void dump() const;
+    std::string print() const;
 
     bool isGreg() const;
     bool isAreg() const;
@@ -2684,7 +2703,7 @@ public:
     bool isAccReg()  const { return getArchRegType() == AREG_ACC0    ||
                                getArchRegType() == AREG_ACC1;    }
     bool isMaskReg() const { return getArchRegType() == AREG_MASK0;   }
-    bool isMsReg()   const { return getArchRegType() == AREG_MS0;     }
+    bool isMsgReg()  const { return getArchRegType() == AREG_MSG0;    }
     bool isDbgReg()  const { return getArchRegType() == AREG_DBG;     }
     bool isSrReg()   const { return getArchRegType() == AREG_SR0;     }
     bool isCrReg()   const { return getArchRegType() == AREG_CR0;     }
@@ -2707,7 +2726,7 @@ public:
         case AREG_A0:
         case AREG_ACC0:
         case AREG_MASK0:
-        case AREG_MS0:
+        case AREG_MSG0:
         case AREG_DBG:
         case AREG_SR0:
         case AREG_CR0:
@@ -4011,7 +4030,7 @@ public:
     G4_Areg* getAcc0Reg() { return ARF_Table[AREG_ACC0]; }
     G4_Areg* getAcc1Reg() { return ARF_Table[AREG_ACC1]; }
     G4_Areg* getDbgReg() { return ARF_Table[AREG_DBG]; }
-    G4_Areg* getMs0Reg() { return ARF_Table[AREG_MS0]; }
+    G4_Areg* getMsg0Reg() { return ARF_Table[AREG_MSG0]; }
     G4_Areg* getSr0Reg() { return ARF_Table[AREG_SR0]; }
     G4_Areg* getCr0Reg() { return ARF_Table[AREG_CR0]; }
     G4_Areg* getTm0Reg() { return ARF_Table[AREG_TM0]; }

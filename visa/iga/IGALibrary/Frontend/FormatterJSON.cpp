@@ -565,7 +565,10 @@ public:
                     emitFloat(imm.f64);
                 }
                 break;
-            case Type::BF8:  emitHex(imm.u8); break;
+            case Type::BF8:
+            case Type::HF8:
+                emitHex(imm.u8);
+                break;
             case Type::V:    emitHex(imm.u32); break;
             case Type::UV:   emitHex(imm.u32); break;
             case Type::VF:   emitHex(imm.u32); break;
@@ -700,6 +703,7 @@ public:
     void emitAddrSurfInfo(const Instruction &i, const MessageInfo &mi) {
         emit("{\"type\":");
         switch (mi.addrType) {
+        case AddrType::INVALID: emit("\"invalid\""); break;
         case AddrType::FLAT: emit("\"flat\""); break;
         case AddrType::BTI:  emit("\"bti\""); break;
         case AddrType::BSS:  emit("\"bss\""); break;

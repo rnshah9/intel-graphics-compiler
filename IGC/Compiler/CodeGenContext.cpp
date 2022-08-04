@@ -13,7 +13,6 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/DebugInfo.h>
 #include "common/LLVMWarningsPop.hpp"
 #include "AdaptorCommon/RayTracing/RayTracingConstantsEnums.h"
-#include "Compiler/CISACodeGen/ComputeShaderCodeGen.hpp"
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
 #include "Compiler/CISACodeGen/OpenCLKernelCodeGen.hpp"
 #include "Compiler/CodeGenPublic.h"
@@ -22,7 +21,8 @@ SPDX-License-Identifier: MIT
 namespace IGC
 {
 
-    typedef struct RetryState {
+    struct RetryState
+    {
         bool allowLICM;
         bool allowCodeSinking;
         bool allowAddressArithmeticSinking;
@@ -33,91 +33,135 @@ namespace IGC
         bool allowLargeURBWrite;
         bool allowConstantCoalescing;
         unsigned nextState;
-    } RetryState;
+    };
 
     static const RetryState RetryTable[] = {
         { true, true, false, false, true, true, true, true, true, 1 },
         { false, true, true, true, false, false, false, false, false, 500 }
     };
 
+    static constexpr size_t RetryTableSize = sizeof(RetryTable) / sizeof(RetryState);
+
     RetryManager::RetryManager() : enabled(false), perKernel(false)
     {
-        memset(m_simdEntries, 0, sizeof(m_simdEntries));
         firstStateId = IGC_GET_FLAG_VALUE(RetryManagerFirstStateId);
         stateId = firstStateId;
-        IGC_ASSERT(stateId < getStateCnt());
+        IGC_ASSERT(stateId < RetryTableSize);
     }
 
-    bool RetryManager::AdvanceState() {
+    bool RetryManager::AdvanceState()
+    {
         if (!enabled || IGC_IS_FLAG_ENABLED(DisableRecompilation))
         {
             return false;
         }
-        IGC_ASSERT(stateId < getStateCnt());
+        IGC_ASSERT(stateId < RetryTableSize);
         stateId = RetryTable[stateId].nextState;
-        return (stateId < getStateCnt());
+        return (stateId < RetryTableSize);
     }
-    bool RetryManager::AllowLICM() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowLICM() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowLICM;
     }
-    bool RetryManager::AllowAddressArithmeticSinking() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowAddressArithmeticSinking() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowAddressArithmeticSinking;
     }
-    bool RetryManager::AllowPromotePrivateMemory() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowPromotePrivateMemory() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowPromotePrivateMemory;
     }
-    bool RetryManager::AllowPreRAScheduler() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowPreRAScheduler() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowPreRAScheduler;
     }
-    bool RetryManager::AllowVISAPreRAScheduler() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowVISAPreRAScheduler() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowVISAPreRAScheduler;
     }
-    bool RetryManager::AllowCodeSinking() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowCodeSinking() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowCodeSinking;
     }
-    bool RetryManager::AllowSimd32Slicing() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowSimd32Slicing() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowSimd32Slicing;
     }
-    bool RetryManager::AllowLargeURBWrite() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowLargeURBWrite() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowLargeURBWrite;
     }
-    bool RetryManager::AllowConstantCoalescing() {
-        IGC_ASSERT(stateId < getStateCnt());
+
+    bool RetryManager::AllowConstantCoalescing() const
+    {
+        IGC_ASSERT(stateId < RetryTableSize);
         return RetryTable[stateId].allowConstantCoalescing;
     }
-    void RetryManager::SetFirstStateId(int id) {
+
+    void RetryManager::SetFirstStateId(int id)
+    {
         firstStateId = id;
     }
-    bool RetryManager::IsFirstTry() {
+
+    bool RetryManager::IsFirstTry() const
+    {
         return (stateId == firstStateId);
     }
-    bool RetryManager::IsLastTry() {
+
+    bool RetryManager::IsLastTry() const
+    {
         return (!enabled ||
             IGC_IS_FLAG_ENABLED(DisableRecompilation) ||
             lastSpillSize < IGC_GET_FLAG_VALUE(AllowedSpillRegCount) ||
-            (stateId < getStateCnt() && RetryTable[stateId].nextState >= getStateCnt()));
+            (stateId < RetryTableSize && RetryTable[stateId].nextState >= RetryTableSize));
     }
-    unsigned RetryManager::GetRetryId() const { return stateId; }
 
-    void RetryManager::Enable() { enabled = true; }
-    void RetryManager::Disable() {
-        if (!perKernel) {
+    unsigned RetryManager::GetRetryId() const
+    {
+        return stateId;
+    }
+
+    void RetryManager::Enable()
+    {
+        enabled = true;
+    }
+
+    void RetryManager::Disable()
+    {
+        if (!perKernel)
+        {
             enabled = false;
         }
     }
 
-    void RetryManager::SetSpillSize(unsigned int spillSize) { lastSpillSize = spillSize; }
-    unsigned int RetryManager::GetLastSpillSize() { return lastSpillSize; }
+    void RetryManager::SetSpillSize(unsigned int spillSize)
+    {
+        lastSpillSize = spillSize;
+    }
 
-    void RetryManager::ClearSpillParams() {
+    unsigned int RetryManager::GetLastSpillSize() const
+    {
+        return lastSpillSize;
+    }
+
+    void RetryManager::ClearSpillParams()
+    {
         lastSpillSize = 0;
         numInstructions = 0;
     }
@@ -125,96 +169,60 @@ namespace IGC
     // save entry for given SIMD mode, to avoid recompile for next retry.
     void RetryManager::SaveSIMDEntry(SIMDMode simdMode, CShader* shader)
     {
-        switch (simdMode)
+        auto entry = GetCacheEntry(simdMode);
+        IGC_ASSERT(entry);
+        if (entry)
         {
-        case SIMDMode::SIMD8:   m_simdEntries[0] = shader;  break;
-        case SIMDMode::SIMD16:  m_simdEntries[1] = shader;  break;
-        case SIMDMode::SIMD32:  m_simdEntries[2] = shader;  break;
-        default:
-            IGC_ASSERT(0);
-            break;
+            entry->shader = shader;
         }
     }
 
     CShader* RetryManager::GetSIMDEntry(SIMDMode simdMode)
     {
-        switch (simdMode)
-        {
-        case SIMDMode::SIMD8:   return m_simdEntries[0];
-        case SIMDMode::SIMD16:  return m_simdEntries[1];
-        case SIMDMode::SIMD32:  return m_simdEntries[2];
-        default:
-            IGC_ASSERT(0);
-            return nullptr;
-        }
+        auto entry = GetCacheEntry(simdMode);
+        IGC_ASSERT(entry);
+        return entry ? entry->shader : nullptr;
     }
 
     RetryManager::~RetryManager()
     {
-        for (unsigned i = 0; i < 3; i++)
+        for (auto& it : cache)
         {
-            if (m_simdEntries[i])
+            if (it.shader)
             {
-                delete m_simdEntries[i];
+                delete it.shader;
             }
         }
     }
 
-    bool RetryManager::AnyKernelSpills()
+    bool RetryManager::AnyKernelSpills() const
     {
-        for (unsigned i = 0; i < 3; i++)
-        {
-            if (m_simdEntries[i] && m_simdEntries[i]->m_spillCost > 0.0)
-            {
-                return true;
-            }
-        }
-        return false;
+        return std::any_of(std::begin(cache), std::end(cache), [](const CacheEntry& entry) {
+            return entry.shader && entry.shader->m_spillCost > 0.0;
+        });
     }
 
     bool RetryManager::PickupKernels(CodeGenContext* cgCtx)
     {
-        if (cgCtx->type == ShaderType::COMPUTE_SHADER)
-        {
-            return PickupCS(static_cast<ComputeShaderContext*>(cgCtx));
-        }
-        else
         {
             IGC_ASSERT_MESSAGE(0, "TODO for other shader types");
             return true;
         }
     }
 
-    unsigned RetryManager::getStateCnt()
-    {
-        return sizeof(RetryTable) / sizeof(RetryState);
-    };
-
     CShader* RetryManager::PickCSEntryForcedFromDriver(SIMDMode& simdMode, unsigned char forcedSIMDModeFromDriver)
     {
-        if (forcedSIMDModeFromDriver == 8)
+        SIMDMode simdModeCandidate = lanesToSIMDMode(forcedSIMDModeFromDriver);
+        auto entry = GetCacheEntry(simdModeCandidate);
+        if (!entry)
         {
-            if ((m_simdEntries[0] && m_simdEntries[0]->m_spillSize == 0) || IsLastTry())
-            {
-                simdMode = SIMDMode::SIMD8;
-                return m_simdEntries[0];
-            }
+            return nullptr;
         }
-        else if (forcedSIMDModeFromDriver == 16)
+
+        if ((entry->shader && entry->shader->m_spillSize == 0) || IsLastTry())
         {
-            if ((m_simdEntries[1] && m_simdEntries[1]->m_spillSize == 0) || IsLastTry())
-            {
-                simdMode = SIMDMode::SIMD16;
-                return m_simdEntries[1];
-            }
-        }
-        else if (forcedSIMDModeFromDriver == 32)
-        {
-            if ((m_simdEntries[2] && m_simdEntries[2]->m_spillSize == 0) || IsLastTry())
-            {
-                simdMode = SIMDMode::SIMD32;
-                return m_simdEntries[2];
-            }
+            simdMode = entry->simdMode;
+            return entry->shader;
         }
         return nullptr;
     }
@@ -224,97 +232,98 @@ namespace IGC
         if (IGC_IS_FLAG_ENABLED(ForceCSSIMD32))
         {
             simdMode = SIMDMode::SIMD32;
-            return m_simdEntries[2];
+            return GetSIMDEntry(simdMode);
         }
         else
-            if (IGC_IS_FLAG_ENABLED(ForceCSSIMD16) && m_simdEntries[1])
+        {
+            if (IGC_IS_FLAG_ENABLED(ForceCSSIMD16) && GetSIMDEntry(SIMDMode::SIMD16))
             {
                 simdMode = SIMDMode::SIMD16;
-                return m_simdEntries[1];
+                return GetSIMDEntry(simdMode);
             }
             else
+            {
                 if (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD)
-                    || (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD4RQ) && cgCtx->hasSyncRTCalls())
-                    )
+                    || (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD4RQ) && cgCtx->hasSyncRTCalls()))
                 {
-                    if (m_simdEntries[0])
-                    {
-                        simdMode = SIMDMode::SIMD8;
-                        return m_simdEntries[0];
-                    }
-                    else
-                        if (m_simdEntries[1])
-                        {
-                            simdMode = SIMDMode::SIMD16;
-                            return m_simdEntries[1];
-                        }
-                        else
-                        {
-                            simdMode = SIMDMode::SIMD32;
-                            return m_simdEntries[2];
-                        }
+                    return PickCSEntryFinally(simdMode);
                 }
-
+            }
+        }
         return nullptr;
     }
 
-    CShader* RetryManager::PickCSEntryEarly(SIMDMode& simdMode,
-        ComputeShaderContext* cgCtx)
+    CShader* RetryManager::PickCSEntryEarly(SIMDMode& simdMode, ComputeShaderContext* cgCtx)
     {
-        float spillThreshold = cgCtx->GetSpillThreshold();
-        float occu8 = cgCtx->GetThreadOccupancy(SIMDMode::SIMD8);
-        float occu16 = cgCtx->GetThreadOccupancy(SIMDMode::SIMD16);
-        float occu32 = cgCtx->GetThreadOccupancy(SIMDMode::SIMD32);
+        struct SIMDInfo {
+            SIMDMode simdMode;
+            CShader* shader;
+            float occupancy;
+            bool noSpill;
+        };
 
-        bool simd32NoSpill = m_simdEntries[2] && m_simdEntries[2]->m_spillCost <= spillThreshold;
-        bool simd16NoSpill = m_simdEntries[1] && m_simdEntries[1]->m_spillCost <= spillThreshold;
-        bool simd8NoSpill = m_simdEntries[0] && m_simdEntries[0]->m_spillCost <= spillThreshold;
+        auto getSIMDInfo = [this, cgCtx](const SIMDMode& simdMode)
+        {
+            CShader* shader = GetSIMDEntry(simdMode);
+            return SIMDInfo{
+                simdMode,
+                shader,
+                cgCtx->GetThreadOccupancy(simdMode),
+                shader && shader->m_spillCost <= cgCtx->GetSpillThreshold()
+            };
+        };
+
+        auto simd8info = getSIMDInfo(SIMDMode::SIMD8);
+        auto simd16info = getSIMDInfo(SIMDMode::SIMD16);
+        auto simd32info = getSIMDInfo(SIMDMode::SIMD32);
 
         // If SIMD32/16/8 are all allowed, then choose one which has highest thread occupancy
 
         if (IGC_IS_FLAG_ENABLED(EnableHighestSIMDForNoSpill))
         {
-            if (simd32NoSpill)
+            if (simd32info.noSpill)
             {
-                simdMode = SIMDMode::SIMD32;
-                return m_simdEntries[2];
+                simdMode = simd32info.simdMode;
+                return simd32info.shader;
             }
 
-            if (simd16NoSpill)
+            if (simd16info.noSpill)
             {
-                simdMode = SIMDMode::SIMD16;
-                return m_simdEntries[1];
+                simdMode = simd16info.simdMode;
+                return simd16info.shader;
             }
         }
         else
         {
-            if (simd32NoSpill)
+            float maxOccupancy = std::max(std::max(simd8info.occupancy, simd16info.occupancy), simd32info.occupancy);
+
+            if (simd32info.noSpill)
             {
-                if (occu32 >= occu16 && occu32 >= occu8)
+                if (simd32info.occupancy == maxOccupancy)
                 {
-                    simdMode = SIMDMode::SIMD32;
-                    return m_simdEntries[2];
+                    simdMode = simd32info.simdMode;
+                    return simd32info.shader;
                 }
-                // If SIMD32 doesn't spill, SIMD16 and SIMD8 shouldn't, if they exist
-                IGC_ASSERT((m_simdEntries[0] == NULL) || simd8NoSpill == true);
-                IGC_ASSERT((m_simdEntries[1] == NULL) || simd16NoSpill == true);
+
+                IGC_ASSERT_MESSAGE(!simd8info.shader || simd8info.noSpill, "If SIMD32 doesn't spill, SIMD8 shouldn't, if it exists");
+                IGC_ASSERT_MESSAGE(!simd16info.shader || simd16info.noSpill, "If SIMD32 doesn't spill, SIMD16 shouldn't, if it exists");
             }
 
-            if (simd16NoSpill)
+            if (simd16info.noSpill)
             {
-                if (occu16 >= occu8 && occu16 >= occu32)
+                if (simd16info.occupancy == maxOccupancy)
                 {
-                    simdMode = SIMDMode::SIMD16;
-                    return m_simdEntries[1];
+                    simdMode = simd16info.simdMode;
+                    return simd16info.shader;
                 }
-                IGC_ASSERT_MESSAGE((m_simdEntries[0] == NULL) || simd8NoSpill == true, "If SIMD16 doesn't spill, SIMD8 shouldn't, if it exists");
+                IGC_ASSERT_MESSAGE(!simd8info.shader || simd8info.noSpill, "If SIMD16 doesn't spill, SIMD8 shouldn't, if it exists");
             }
         }
 
         bool needToRetry = false;
         if (cgCtx->m_slmSize)
         {
-            if (occu16 > occu8 || occu32 > occu16)
+            if (simd16info.occupancy > simd8info.occupancy || simd32info.occupancy > simd16info.occupancy)
             {
                 needToRetry = true;
             }
@@ -323,10 +332,10 @@ namespace IGC
         SIMDMode maxSimdMode = cgCtx->GetMaxSIMDMode();
         if (maxSimdMode == SIMDMode::SIMD8 || !needToRetry)
         {
-            if (m_simdEntries[0] && m_simdEntries[0]->m_spillSize == 0)
+            if (simd8info.shader && simd8info.shader->m_spillSize == 0)
             {
-                simdMode = SIMDMode::SIMD8;
-                return m_simdEntries[0];
+                simdMode = simd8info.simdMode;
+                return simd8info.shader;
             }
         }
         return nullptr;
@@ -334,109 +343,25 @@ namespace IGC
 
     CShader* RetryManager::PickCSEntryFinally(SIMDMode& simdMode)
     {
-        if (m_simdEntries[0])
+        for (const auto& it : cache)
         {
-            simdMode = SIMDMode::SIMD8;
-            return m_simdEntries[0];
+            if (it.shader)
+            {
+                simdMode = it.simdMode;
+                return it.shader;
+            }
         }
-        else
-            if (m_simdEntries[1])
-            {
-                simdMode = SIMDMode::SIMD16;
-                return m_simdEntries[1];
-            }
-            else
-            {
-                simdMode = SIMDMode::SIMD32;
-                return m_simdEntries[2];
-            }
+        return nullptr;
     }
 
-    void RetryManager::FreeAllocatedMemForNotPickedCS(SIMDMode simdMode)
+
+
+    RetryManager::CacheEntry* RetryManager::GetCacheEntry(SIMDMode simdMode)
     {
-        if (simdMode != SIMDMode::SIMD8 && m_simdEntries[0] != nullptr)
-        {
-            if (m_simdEntries[0]->ProgramOutput()->m_programBin != nullptr)
-                aligned_free(m_simdEntries[0]->ProgramOutput()->m_programBin);
-        }
-        if (simdMode != SIMDMode::SIMD16 && m_simdEntries[1] != nullptr)
-        {
-            if (m_simdEntries[1]->ProgramOutput()->m_programBin != nullptr)
-                aligned_free(m_simdEntries[1]->ProgramOutput()->m_programBin);
-        }
-        if (simdMode != SIMDMode::SIMD32 && m_simdEntries[2] != nullptr)
-        {
-            if (m_simdEntries[2]->ProgramOutput()->m_programBin != nullptr)
-                aligned_free(m_simdEntries[2]->ProgramOutput()->m_programBin);
-        }
-    }
-
-    bool RetryManager::PickupCS(ComputeShaderContext* cgCtx)
-    {
-        SIMDMode simdMode = SIMDMode::UNKNOWN;
-        CComputeShader* shader = nullptr;
-        SComputeShaderKernelProgram* pKernelProgram = &cgCtx->programOutput;
-
-        if (cgCtx->getModuleMetaData()->csInfo.forcedSIMDSize != 0)
-        {
-            shader = static_cast<CComputeShader*>(
-                PickCSEntryForcedFromDriver(simdMode, cgCtx->getModuleMetaData()->csInfo.forcedSIMDSize));
-        }
-        if (!shader)
-        {
-            shader = static_cast<CComputeShader*>(
-                PickCSEntryByRegKey(simdMode, cgCtx));
-        }
-        if (!shader)
-        {
-            shader = static_cast<CComputeShader*>(
-                PickCSEntryEarly(simdMode, cgCtx));
-        }
-        if (!shader && IsLastTry())
-        {
-            shader = static_cast<CComputeShader*>(
-                PickCSEntryFinally(simdMode));
-            IGC_ASSERT(shader != nullptr);
-        }
-
-        if (shader)
-        {
-            switch (simdMode)
-            {
-            case SIMDMode::SIMD8:
-                pKernelProgram->simd8 = *shader->ProgramOutput();
-                pKernelProgram->SimdWidth = USC::GFXMEDIA_GPUWALKER_SIMD8;
-                cgCtx->SetSIMDInfo(SIMD_SELECTED, simdMode,
-                    ShaderDispatchMode::NOT_APPLICABLE);
-                break;
-
-            case SIMDMode::SIMD16:
-                pKernelProgram->simd16 = *shader->ProgramOutput();
-                pKernelProgram->SimdWidth = USC::GFXMEDIA_GPUWALKER_SIMD16;
-                cgCtx->SetSIMDInfo(SIMD_SELECTED, simdMode,
-                    ShaderDispatchMode::NOT_APPLICABLE);
-                break;
-
-            case SIMDMode::SIMD32:
-                pKernelProgram->simd32 = *shader->ProgramOutput();
-                pKernelProgram->SimdWidth = USC::GFXMEDIA_GPUWALKER_SIMD32;
-                cgCtx->SetSIMDInfo(SIMD_SELECTED, simdMode,
-                    ShaderDispatchMode::NOT_APPLICABLE);
-                break;
-
-            default:
-                IGC_ASSERT_MESSAGE(0, "Invalie SIMDMode");
-                break;
-            }
-            shader->FillProgram(pKernelProgram);
-            pKernelProgram->SIMDInfo = cgCtx->GetSIMDInfo();
-
-            // free allocated memory for the remaining kernels
-            FreeAllocatedMemForNotPickedCS(simdMode);
-
-            return true;
-        }
-        return false;
+        auto result = std::find_if(std::begin(cache), std::end(cache), [&simdMode](const CacheEntry& entry) {
+            return entry.simdMode == simdMode;
+        });
+        return result != std::end(cache) ? result : nullptr;
     }
 
     LLVMContextWrapper::LLVMContextWrapper(bool createResourceDimTypes)
@@ -531,6 +456,46 @@ namespace IGC
         return m_slmSize ? spillThresholdSLM : spillThresholdNoSLM;
     }
 
+    bool ComputeShaderContext::CheckSLMLimit(SIMDMode simdMode)
+    {
+        // check if SLM fits in DSS
+        if (IGC_IS_FLAG_ENABLED(CheckCSSLMLimit) &&
+            getModuleMetaData()->csInfo.waveSize == 0 &&
+            platform.isProductChildOf(IGFX_DG2) &&
+            m_DriverInfo.SupportCSSLMLimit() &&
+            m_slmSize > 0)
+        {
+            unsigned int slmPerDSS = 0; // in kB
+            switch (simdMode)
+            {
+                // # Unfused EU = 16
+                // # HW threads/EU = 8
+                // SIMD16: 16*8*16 = 2048 pixelsPerDSS
+                // SIMD32: 16*8*32 = 4096 pixelsPerDSS
+                //
+                // To calculate SLM/DSS in kB
+                // ThreadGroupSize (TGSize) is # pixels in Thread Group
+                // (m_slmSize * pixelsPerDSS / TGSize) / 1024
+            case SIMDMode::SIMD16:
+                slmPerDSS = m_slmSize * 2 / GetThreadGroupSize();
+                break;
+            case SIMDMode::SIMD32:
+                slmPerDSS = m_slmSize * 4 / GetThreadGroupSize();
+                break;
+            default:
+                break;
+            }
+
+            if (slmPerDSS > 128) {
+                SetSIMDInfo(SIMD_SKIP_PERF, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
+                return false;
+            }
+
+        }
+
+        return true;
+    }
+
     bool OpenCLProgramContext::isSPIRV() const
     {
         return isSpirV;
@@ -540,6 +505,12 @@ namespace IGC
     {
         isSpirV = true;
     }
+
+    bool OpenCLProgramContext::needsDivergentBarrierHandling() const {
+        return IGC_IS_FLAG_ENABLED(EnableDivergentBarrierWA) ||
+               m_InternalOptions.EnableDivergentBarrierHandling;
+    }
+
     float OpenCLProgramContext::getProfilingTimerResolution()
     {
         return m_ProfilingTimerResolution;
@@ -559,7 +530,7 @@ namespace IGC
         return 0;
     }
 
-    uint32_t OpenCLProgramContext::getNumGRFPerThread() const
+    uint32_t OpenCLProgramContext::getNumGRFPerThread(bool returnDefault) const
     {
         if (platform.supportsStaticRegSharing())
         {
@@ -572,17 +543,27 @@ namespace IGC
                 return 256;
             }
         }
-        return CodeGenContext::getNumGRFPerThread();
+        return CodeGenContext::getNumGRFPerThread(returnDefault);
     }
 
     bool OpenCLProgramContext::forceGlobalMemoryAllocation() const
     {
-        return m_InternalOptions.ForceGlobalMemoryAllocation;
+        return m_InternalOptions.ForceGlobalMemoryAllocation ||
+               (m_hasGlobalInPrivateAddressSpace &&
+                (m_InternalOptions.EnableZEBinary|| IGC_IS_FLAG_ENABLED(EnableZEBinary)));
     }
 
     bool OpenCLProgramContext::allocatePrivateAsGlobalBuffer() const
     {
-        return forceGlobalMemoryAllocation() || (m_instrTypes.hasDynamicGenericLoadStore && platform.canForcePrivateToGlobal());
+        return forceGlobalMemoryAllocation() ||
+            (m_instrTypes.hasDynamicGenericLoadStore &&
+                platform.canForcePrivateToGlobal()) ||
+            m_mustAllocatePrivateAsGlobalBuffer;
+    }
+
+    bool OpenCLProgramContext::noLocalToGenericOptionEnabled() const
+    {
+        return m_InternalOptions.NoLocalToGeneric;
     }
 
     bool OpenCLProgramContext::enableTakeGlobalAddress() const
@@ -652,8 +633,8 @@ namespace IGC
     void OpenCLProgramContext::InternalOptions::parseOptions(const char* IntOptStr)
     {
         // Assume flags is in the form: <f0>[=<v0>] <f1>[=<v1>] ...
-        // flag name and its value are either seperated by ' ' or '=';
-        // flag seperator is always ' '.
+        // flag name and its value are either seperated by one or many ' ' or a single '='.
+        // A flag seperator between two flags is always one or many ' '.
         const char* NAMESEP = " =";  // separator b/w name and its value
 
         llvm::StringRef opts(IntOptStr);
@@ -793,6 +774,11 @@ namespace IGC
             {
                 IntelEnablePreRAScheduling = false;
             }
+            // -cl-intel-no-local-to-generic
+            else if (suffix.equals("-no-local-to-generic"))
+            {
+                NoLocalToGeneric = true;
+            }
             // -cl-intel-force-global-mem-allocation
             else if (suffix.equals("-force-global-mem-allocation"))
             {
@@ -920,6 +906,10 @@ namespace IGC
             {
                 ExcludeIRFromZEBinary = true;
             }
+            else if (suffix.equals("-emit-zebin-visa-sections"))
+            {
+                EmitZeBinVISASections = true;
+            }
             // -cl-intel-no-spill
             else if (suffix.equals("-no-spill"))
             {
@@ -978,6 +968,28 @@ namespace IGC
             {
                 FailOnSpill = true;
             }
+            // -[cl|ze]-load-cache-default[=| ]<positive int>
+            // -[cl|ze]-store-cache-default[=| ]<positive int>
+            else if (suffix.equals("-load-cache-default") || suffix.equals("-store-cache-default"))
+            {
+                bool isLoad = suffix.equals("-load-cache-default");
+                int val;
+                size_t valStart = opts.find_first_not_of(' ', ePos + 1);
+                size_t valEnd = opts.find_first_of(' ', valStart);
+                llvm::StringRef valStr = opts.substr(valStart, valEnd - valStart);
+                if (valStr.getAsInteger(10, val))
+                {
+                    IGC_ASSERT(0);
+                }
+                if (val >= 0)
+                {
+                    if (isLoad)
+                        LoadCacheDefault = val;
+                    else
+                        StoreCacheDefault = val;
+                }
+                Pos = valEnd;
+            }
             // -cl-poison-unsupported-fp64-kernels
             // -ze-poison-unsupported-fp64-kernels
             else if (suffix.equals("-poison-unsupported-fp64-kernels"))
@@ -1017,6 +1029,10 @@ namespace IGC
                 }
                 Pos = valueEnd;
                 continue;
+            }
+            else if (suffix.equals("-enable-divergent-barrier-handling"))
+            {
+                EnableDivergentBarrierHandling = true;
             }
 
             // advance to the next flag
@@ -1375,7 +1391,9 @@ namespace IGC
         return 0;
     }
 
-    uint32_t CodeGenContext::getNumGRFPerThread() const
+    /// parameter "returnDefault" controls what to return when
+    /// there is no user-forced setting
+    uint32_t CodeGenContext::getNumGRFPerThread(bool returnDefault) const
     {
         constexpr uint32_t DEFAULT_TOTAL_GRF_NUM = 128;
 
@@ -1397,7 +1415,7 @@ namespace IGC
         {
             return IGC_GET_FLAG_VALUE(TotalGRFNum4CS);
         }
-        return DEFAULT_TOTAL_GRF_NUM;
+        return (returnDefault ? DEFAULT_TOTAL_GRF_NUM : 0);
     }
 
     bool CodeGenContext::forceGlobalMemoryAllocation() const
@@ -1406,6 +1424,11 @@ namespace IGC
     }
 
     bool CodeGenContext::allocatePrivateAsGlobalBuffer() const
+    {
+        return false;
+    }
+
+    bool CodeGenContext::noLocalToGenericOptionEnabled() const
     {
         return false;
     }

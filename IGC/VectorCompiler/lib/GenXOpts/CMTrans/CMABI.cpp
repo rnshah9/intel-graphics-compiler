@@ -21,9 +21,9 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "cmabi"
 
 #include "llvmWrapper/Analysis/CallGraph.h"
+#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/Support/Alignment.h"
@@ -83,6 +83,8 @@ SPDX-License-Identifier: MIT
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#define DEBUG_TYPE "cmabi"
 
 using namespace llvm;
 
@@ -365,7 +367,7 @@ bool CMABI::runOnSCC(CallGraphSCC &SCC) {
       continue;
     for (auto ui = F->use_begin(), ue = F->use_end(); ui != ue; ++ui) {
       auto CI = dyn_cast<CallInst>(ui->getUser());
-      if (CI && CI->getNumArgOperands() == ui->getOperandNo())
+      if (CI && IGCLLVM::getNumArgOperands(CI) == ui->getOperandNo())
         diagnoseOverlappingArgs(CI);
     }
   }
@@ -402,7 +404,7 @@ void CMABI::LocalizeGlobals(LocalizationInfo &LI) {
     LLVM_DEBUG(dbgs() << "Localizing global: " << *GV << "\n  ");
 
     Instruction &FirstI = *Fn->getEntryBlock().begin();
-    Type *ElemTy = GV->getType()->getElementType();
+    Type *ElemTy = GV->getType()->getPointerElementType();
     IGCLLVM::Align GVAlign = IGCLLVM::getCorrectAlign(GV->getAlignment());
     AllocaInst *Alloca = new AllocaInst(ElemTy, vc::AddrSpace::Private,
                                         /*ArraySize=*/nullptr, GVAlign,
@@ -493,9 +495,9 @@ CallGraphNode *CMABI::TransformKernel(Function *F) {
         ArgTys.push_back(Ty);
     } else {
       // Unchanged argument
-      AttributeSet attrs = PAL.getParamAttributes(ArgIndex);
+      AttributeSet attrs = IGCLLVM::getParamAttrs(PAL, ArgIndex);
       if (attrs.hasAttributes()) {
-        AttrBuilder B(attrs);
+        IGCLLVM::AttrBuilder B{ Context, attrs };
         AttrVec = AttrVec.addParamAttributes(Context, ArgTys.size(), B);
       }
       ArgTys.push_back(I->getType());
@@ -507,10 +509,10 @@ CallGraphNode *CMABI::TransformKernel(Function *F) {
     "type out of sync, expect bool arguments");
 
   // Add any function attributes.
-  AttributeSet FnAttrs = PAL.getFnAttributes();
+  AttributeSet FnAttrs = IGCLLVM::getFnAttrs(PAL);
   if (FnAttrs.hasAttributes()) {
-    AttrBuilder B(FnAttrs);
-    AttrVec = AttrVec.addAttributes(Context, AttributeList::FunctionIndex, B);
+    IGCLLVM::AttrBuilder B(Context, FnAttrs);
+    AttrVec = IGCLLVM::addAttributesAtIndex(AttrVec, Context, AttributeList::FunctionIndex, B);
   }
 
   // Create the new function body and insert it into the module.
@@ -712,7 +714,7 @@ void CMABI::diagnoseOverlappingArgs(CallInst *CI)
   std::set<std::pair<unsigned, unsigned>> Reported;
   // Using ArgIndex starting at 1 so we can reserve 0 to mean "element does not
   // come from any by-ref arg".
-  for (unsigned ArgIndex = 1, NumArgs = CI->getNumArgOperands();
+  for (unsigned ArgIndex = 1, NumArgs = IGCLLVM::getNumArgOperands(CI);
       ArgIndex <= NumArgs; ++ArgIndex) {
     Value *Arg = CI->getOperand(ArgIndex - 1);
     if (!Arg->getType()->isPointerTy())
@@ -1069,7 +1071,7 @@ bool CMLowerVLoadVStore::lowerLoadStore(Function &F) {
           IRBuilder<> Builder(&Inst);
           if (GenXIntrinsic::isVStore(&Inst)) {
             auto PtrTy = cast<PointerType>(Inst.getOperand(1)->getType());
-            PtrTy = PointerType::get(PtrTy->getElementType(), AS1);
+            PtrTy = PointerType::get(PtrTy->getPointerElementType(), AS1);
             auto PtrCast = Builder.CreateAddrSpaceCast(Inst.getOperand(1), PtrTy);
             Type* Tys[] = { Inst.getOperand(0)->getType(),
                            PtrCast->getType() };
@@ -1080,7 +1082,7 @@ bool CMLowerVLoadVStore::lowerLoadStore(Function &F) {
           }
           else {
             auto PtrTy = cast<PointerType>(Inst.getOperand(0)->getType());
-            PtrTy = PointerType::get(PtrTy->getElementType(), AS1);
+            PtrTy = PointerType::get(PtrTy->getPointerElementType(), AS1);
             auto PtrCast = Builder.CreateAddrSpaceCast(Inst.getOperand(0), PtrTy);
             Type* Tys[] = { Inst.getType(), PtrCast->getType() };
             Function* Fn = GenXIntrinsic::getGenXDeclaration(
@@ -1308,7 +1310,7 @@ void ArgRefPattern::process(DominatorTree &DT) {
     Builder.SetInsertPoint(LI);
     Value *SrcVal = Builder.CreateLoad(
         BaseAlloca->getType()->getPointerElementType(), BaseAlloca);
-    SmallVector<Value *, 8> Args(CopyInRegion->arg_operands());
+    SmallVector<Value *, 8> Args(IGCLLVM::args(CopyInRegion));
     Args[0] = SrcVal;
     Value *Val = Builder.CreateCall(RdFn, Args);
     LI->replaceAllUsesWith(Val);

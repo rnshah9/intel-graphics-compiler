@@ -11,8 +11,6 @@ SPDX-License-Identifier: MIT
 // for use by live range segments. See GenXNumbering.h.
 //
 //===----------------------------------------------------------------------===//
-#define DEBUG_TYPE "GENX_NUMBERING"
-
 #include "GenXNumbering.h"
 #include "GenX.h"
 #include "GenXBaling.h"
@@ -20,12 +18,14 @@ SPDX-License-Identifier: MIT
 #include "vc/Utils/GenX/KernelInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/Instructions.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/Debug.h"
 
 #include "llvmWrapper/IR/InstrTypes.h"
 #include "Probe/Assertion.h"
+
+#define DEBUG_TYPE "GENX_NUMBERING"
 
 using namespace llvm;
 using namespace genx;
@@ -120,7 +120,7 @@ unsigned GenXNumbering::numberInstructionsInFunc(Function *Func, unsigned Num)
           // wasting numbers does not really matter.
           PreReserve = 2 * IndexFlattener::getNumArgElements(
                 CI->getFunctionType());
-          PreReserve += 2 * CI->getNumArgOperands(); // extra for pre-copy addresses of args
+          PreReserve += 2 * IGCLLVM::getNumArgOperands(CI); // extra for pre-copy addresses of args
           unsigned NumRetVals = IndexFlattener::getNumElements(CI->getType());
           PreReserve += NumRetVals; // extra for pre-copy addresses of retvals
           PostReserve = NumRetVals;

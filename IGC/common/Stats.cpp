@@ -139,6 +139,36 @@ void ShaderStats::printSumShaderStats()
             fprintf(fileName_sqm,"total SIMD32 spill count = %d\n", m_CompileShaderStats[STATS_ISA_SPILL32]);
             printf("total SIMD32 spill count = %d\n", m_CompileShaderStats[STATS_ISA_SPILL32]);
         }
+        if (m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE8] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD8 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE8]);
+            printf("total SIMD8 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE8]);
+        }
+        if (m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE16] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD16 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE16]);
+            printf("total SIMD16 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE16]);
+        }
+        if (m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE32] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD32 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE32]);
+            printf("total SIMD32 cycle estimate = %d\n", m_CompileShaderStats[STATS_ISA_CYCLE_ESTIMATE32]);
+        }
+        if (m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE8] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD8 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE8]);
+            printf("total SIMD8 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE8]);
+        }
+        if (m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE16] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD16 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE16]);
+            printf("total SIMD16 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE16]);
+        }
+        if (m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE32] != 0)
+        {
+            fprintf(fileName_sqm, "total SIMD32 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE32]);
+            printf("total SIMD32 stall estimate = %d\n", m_CompileShaderStats[STATS_ISA_STALL_ESTIMATE32]);
+        }
         fprintf(fileName_sqm, "total SIMD8  shaders = %d\n", m_TotalSimd8);
         fprintf(fileName_sqm, "total SIMD16 shaders = %d\n", m_TotalSimd16);
         fprintf(fileName_sqm, "total SIMD32 shaders = %d\n", m_TotalSimd32);
@@ -197,207 +227,6 @@ void ShaderStats::printShaderStats( ShaderHash hash, ShaderType shaderType, cons
 
     fprintf(fileName, "\n");
     fclose(fileName);
-}
-
-void ShaderStats::printOpcodeStats(ShaderHash hash, ShaderType shaderType, const std::string &postFix)
-{
-    /*const std::string opcodeFilePath = IGC::Debug::GetShaderOutputFolder() + std::string("\\SQM\\") + IGC::Debug::GetShaderCorpusName() + "OpcodeShaderStats.csv";
-    const char *opcodeFile = opcodeFilePath.c_str();
-
-    const std::string targetUnitFilePath = IGC::Debug::GetShaderOutputFolder() + std::string("\\SQM\\") + IGC::Debug::GetShaderCorpusName() + "TargetUnitShaderStats.csv";
-    const char *targetUnitFile = targetUnitFilePath.c_str();
-
-    const std::string listFilePath = IGC::Debug::GetShaderOutputFolder() + std::string("\\SQM\\") + IGC::Debug::GetShaderCorpusName() + "ShadersList.txt";
-    const char *listUnitFile = listFilePath.c_str();
-
-    FILE* opcodeFileName = fopen(opcodeFile, "a");
-    FILE* targetUnitFileName = fopen(targetUnitFile, "a");
-    FILE* listUnitFileName = fopen(listUnitFile, "a");
-
-    std::string asmFileName;
-    if (shaderType == ShaderType::OPENCL_SHADER)
-    {
-        asmFileName =
-            IGC::Debug::DumpName(IGC::Debug::GetShaderOutputName())
-            .Type(shaderType)
-            .Hash(hash)
-            .PostFix(postFix)
-            .Extension("asm")
-            .str();
-        if (asmFileName.find_last_of("\\") != std::string::npos)
-        {
-            asmFileName = asmFileName.substr(asmFileName.find_last_of("\\") + 1, asmFileName.size());
-        }
-    }
-    else
-    {
-        asmFileName =
-            IGC::Debug::DumpName(IGC::Debug::GetShaderOutputName())
-            .Type(shaderType)
-            .Hash(hash)
-            .Extension("asm")
-            .str();
-        if (asmFileName.find_last_of("\\") != std::string::npos)
-        {
-            asmFileName = asmFileName.substr(asmFileName.find_last_of("\\") + 1, asmFileName.size());
-        }
-    }
-
-
-    fprintf(opcodeFileName, "%s","");
-    fclose(opcodeFileName);
-
-    fprintf(targetUnitFileName, "%s","");
-    fclose(targetUnitFileName);
-
-    fprintf(listUnitFileName, "%s\n", asmFileName.c_str());
-    fclose(listUnitFileName);
-    ?*/
-}
-
-void ShaderStats::parseIsaShader( ShaderHash hash, ShaderType shaderType, SIMDMode simd )
-{
-
-    std::string line, instStr;
-
-    std::string asmFileName =
-        IGC::Debug::DumpName(IGC::Debug::GetShaderOutputName())
-            .Type(shaderType)
-            .Hash(hash)
-            .SIMDSize(simd)
-            .Extension("asm")
-            .str();
-    if (asmFileName.find_last_of("\\") != std::string::npos)
-    {
-        asmFileName = asmFileName.substr(asmFileName.find_last_of("\\") + 1, asmFileName.size());
-    }
-
-    std::ifstream asmFile(asmFileName.c_str());
-
-    while( getline(asmFile, line) )
-    {
-        if( line == ".code" )
-        {
-            break;
-        }
-    }
-
-    while( getline(asmFile, line) )
-    {
-        if( line == "" || line.find( "//", 0 ) == 0 || line == "main:" || line.find( "label", 0 ) == 0)
-        {
-            continue;
-        }
-        else if (line.find(" ", 0) == std::string::npos && line.find(":", 0) == line.size() - 1)
-        {
-            continue;
-        }
-        else if( line == ".end_code" )
-        {
-            break;
-        }
-
-        if( line.find("(",0 ) == 0 )
-        {
-            line = line.substr( line.find(")",0) + 2, line.length() );
-        }
-
-        instStr = line.substr( 0, line.find(" ", 0) );
-
-        auto hasDot = instStr.find(".",0);
-        if (hasDot != std::string::npos)
-        {
-            instStr = instStr.substr( 0, hasDot );
-        }
-
-        if( line.find("L",0) == 0  || line.find("_AUTO_LABEL", 0) == 0)
-        {
-            m_CompileShaderStats[STATS_ISA_BASIC_BLOCKS]++;
-        }
-        else if( instStr == "add" || instStr == "addc" || instStr == "avg" || instStr == "dp2" ||
-            instStr == "dp3" || instStr == "dp4" || instStr == "dph" || instStr == "frc" ||
-            instStr == "line" || instStr == "lrp" || instStr == "mac" || instStr == "mach" ||
-            instStr == "mad" || instStr == "madm" || instStr == "math" || instStr == "mul" ||
-            instStr == "pln" || instStr == "rndd" || instStr == "rnde" || instStr == "rndu" ||
-            instStr == "rndz" || instStr == "sad2" || instStr == "sada2" || instStr == "subb" )
-        {
-            m_CompileShaderStats[STATS_ISA_ALU]++;
-        }
-        else if( instStr == "and" || instStr == "asr" || instStr == "bfe" || instStr == "bfi1" ||
-            instStr == "bfi2" || instStr == "bfrev" || instStr == "cbit" || instStr == "fbh" ||
-            instStr == "fbl" || instStr == "lzd" || instStr == "not" || instStr == "or" ||
-            instStr == "shl" || instStr == "shr" || instStr == "xor" )
-        {
-            m_CompileShaderStats[STATS_ISA_LOGIC]++;
-        }
-        else if( instStr == "brc" || instStr == "brd" || instStr == "jumpi")
-        {
-            m_CompileShaderStats[STATS_ISA_THREADCF]++;
-        }
-        else if(instStr == "break" || instStr == "cont" || instStr == "while" ||
-            instStr == "else" || instStr == "endif" || instStr == "if" )
-        {
-            m_CompileShaderStats[STATS_ISA_STRUCTCF]++;
-        }
-        else if( instStr == "goto" || instStr == "join" )
-        {
-            m_CompileShaderStats[STATS_ISA_GOTOJOIN]++;
-        }
-        else if( instStr == "call" || instStr == "calla" )
-        {
-            m_CompileShaderStats[STATS_ISA_CALL]++;
-        }
-        else if( instStr == "cmp" || instStr == "cmpn" || instStr == "csel" || instStr == "sel")
-        {
-            m_CompileShaderStats[STATS_ISA_SEL_CMP]++;
-        }
-        else if( instStr == "mov" || instStr == "movi" || instStr == "smov" )
-        {
-            m_CompileShaderStats[STATS_ISA_MOV]++;
-        }
-        else if( instStr == "send" || instStr == "sendc" || instStr == "sends" )
-        {
-            m_CompileShaderStats[STATS_ISA_SEND]++;
-        }
-        else if( instStr == "halt" || instStr == "illegal" || instStr == "nop" || instStr == "wait" ||
-            instStr == "ret" )
-        {
-            m_CompileShaderStats[STATS_ISA_OTHERS]++;
-        }
-        else if( line.find( "_GOTO_TARGET", 0 ) == 0 )
-        {
-            ;
-        }
-        else
-        {
-            IGC_ASSERT(0);
-        }
-    }
-
-    int statsIndex = STATS_ISA_INST_COUNT;
-    if( simd == SIMDMode::SIMD16 )
-    {
-        statsIndex = STATS_ISA_INST_COUNT_SIMD16;
-    }
-    else if( simd == SIMDMode::SIMD32 )
-    {
-        statsIndex = STATS_ISA_INST_COUNT_SIMD32;
-    }
-
-    for( int i=STATS_ISA_ALU; i<STATS_MAX_SHADER_STATS_ITEMS; i++)
-    {
-        m_CompileShaderStats[statsIndex] += m_CompileShaderStats[i];
-    }
-
-    if( simd == SIMDMode::SIMD16 )
-    {
-        m_CompileShaderStats[STATS_ISA_INST_COUNT_SIMD16] -= m_CompileShaderStats[STATS_ISA_INST_COUNT];
-    }
-    else if( simd == SIMDMode::SIMD32 )
-    {
-        m_CompileShaderStats[STATS_ISA_INST_COUNT_SIMD32] -= m_CompileShaderStats[STATS_ISA_INST_COUNT];
-    }
-    asmFile.close();
 }
 
 void ShaderStats::sumShaderStat( SHADER_STATS_ITEMS compileInterval, int count )
@@ -1559,35 +1388,7 @@ void CMemoryReport::CopyToSummary()
 
 const char* CMemoryReport::ShaderTypeText()
 {
-    if( m_type == ShaderType::PIXEL_SHADER )
-    {
-        return "PS";
-    }
-    else if( m_type == ShaderType::VERTEX_SHADER )
-    {
-        return "VS";
-    }
-    else if( m_type == ShaderType::GEOMETRY_SHADER )
-    {
-        return "GS";
-    }
-    else if( m_type == ShaderType::HULL_SHADER )
-    {
-        return "HS";
-    }
-    else if( m_type == ShaderType::DOMAIN_SHADER )
-    {
-        return "DS";
-    }
-    else if( m_type == ShaderType::COMPUTE_SHADER )
-    {
-        return "CS";
-    }
-    else if( m_type == ShaderType::OPENCL_SHADER )
-    {
-        return "OCL";
-    }
-    return "";
+    return IGC::Debug::GetShaderTypeAcronym(m_type);
 }
 
 void CMemoryReport::DumpSummaryStats()

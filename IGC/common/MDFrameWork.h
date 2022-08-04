@@ -334,6 +334,7 @@ namespace IGC
         std::vector<std::string> m_OpenCLArgBaseTypes;
         std::vector<std::string> m_OpenCLArgTypeQualifiers;
         std::vector<std::string> m_OpenCLArgNames;
+        std::vector<bool> m_OpenCLArgScalarAsPointers;
     };
 
     // isCloned member is added to mark whether a function is clone
@@ -405,13 +406,18 @@ namespace IGC
         // are not supported by ZEBinary
         bool EnableZEBinary                             = false;
         bool ExcludeIRFromZEBinary                      = false;
+        bool EmitZeBinVISASections                      = false;
 
         //when true, compiler disables the Remat optimization for compute shaders
         bool allowDisableRematforCS                     = false;
 
         bool DisableIncSpillCostAllAddrTaken            = false;
         bool DisableCPSOmaskWA                          = false;
+
+        bool DisableFastestGopt                         = false;
         bool WaForceHalfPromotion                       = false;
+
+        bool EnableUndefAlphaOutputAsRed                = true;
     };
 
     enum class ThreadIDLayout
@@ -469,6 +475,8 @@ namespace IGC
         unsigned char NumSamples             = 0;
         std::vector<int> blendOptimizationMode;
         std::vector<int> colorOutputMask;
+
+        bool WaDisableVRS                                           = false;
     };
 
     struct MeshShaderInfo
@@ -572,6 +580,7 @@ namespace IGC
     struct ImmConstantInfo
     {
         std::vector<char> data;
+        std::map<unsigned, unsigned> sizes;
     };
 
     struct PointerProgramBinaryInfo

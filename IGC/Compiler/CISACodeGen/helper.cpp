@@ -303,7 +303,7 @@ namespace IGC
     llvm::LoadInst* cloneLoad(llvm::LoadInst* Orig, llvm::Value* Ptr)
     {
         llvm::LoadInst* LI = new llvm::LoadInst(
-            cast<PointerType>(Ptr->getType())->getElementType(),
+            cast<PointerType>(Ptr->getType())->getPointerElementType(),
             Ptr, "", false, Orig);
         LI->setVolatile(Orig->isVolatile());
         LI->setAlignment(IGCLLVM::getCorrectAlign(Orig->getAlignment()));
@@ -359,9 +359,9 @@ namespace IGC
                 GenISAIntrinsic::GenISA_ldraw_indexed,
             tys);
 
-        unsigned alignment = inst->getAlignment();
+        unsigned alignment = (unsigned)inst->getAlignment();
         if (alignment == 0)
-            alignment = DL.getABITypeAlignment(inst->getType());
+            alignment = (unsigned)DL.getABITypeAlignment(inst->getType());
 
         IRBuilder<> builder(inst);
 
@@ -406,9 +406,9 @@ namespace IGC
             func = GenISAIntrinsic::getDeclaration(module, llvm::GenISAIntrinsic::GenISA_storeraw_indexed, types);
         }
         IRBuilder<> builder(inst);
-        unsigned alignment = inst->getAlignment();
+        unsigned alignment = (unsigned)inst->getAlignment();
         if (alignment == 0)
-            alignment = DL.getABITypeAlignment(storeVal->getType());
+            alignment = (unsigned)DL.getABITypeAlignment(storeVal->getType());
         Value* attr[] =
         {
             bufPtr,
@@ -959,7 +959,7 @@ namespace IGC
         llvm::Function* pCalledFunc = pIntr->getCalledFunction();
 
         // Look at the intrinsic and figure out which pointer to change
-        int num_ops = pIntr->getNumArgOperands();
+        int num_ops = IGCLLVM::getNumArgOperands(pIntr);
         llvm::SmallVector<llvm::Value*, 5> args;
 
         for (int i = 0; i < num_ops; ++i)
@@ -2676,7 +2676,7 @@ namespace IGC
 
             if (instType && instType->getAddressSpace() == oldAS)
             {
-                Type* eltType = instType->getElementType();
+                Type* eltType = instType->getPointerElementType();
                 PointerType* ptrType = PointerType::get(eltType, newAS);
                 inst->mutateType(ptrType);
                 FixAddressSpaceInAllUses(inst, newAS, oldAS);

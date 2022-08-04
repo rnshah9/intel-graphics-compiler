@@ -13,6 +13,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Verifier.h>
 #include <llvm/Analysis/CFGPrinter.h>
 #include <llvm/Analysis/Passes.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Pass.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Transforms/IPO.h>
@@ -21,9 +22,8 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
-#include <llvm/Transforms/InstCombine/InstCombineWorklist.h>
-#include <llvm/Transforms/InstCombine/InstCombine.h>
 
+#include <llvmWrapper/Transforms/InstCombine/InstCombineWorklist.h>
 #include <llvmWrapper/Transforms/Utils.h>
 
 #include "common/LLVMWarningsPop.hpp"
@@ -32,6 +32,7 @@ SPDX-License-Identifier: MIT
 #include "AdaptorCommon/ProcessFuncAttributes.h"
 #include "AdaptorCommon/LegalizeFunctionSignatures.h"
 #include "AdaptorCommon/TypesLegalizationPass.hpp"
+#include "AdaptorCommon/DivergentBarrierPass.h"
 #include "common/LLVMUtils.h"
 
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
@@ -111,6 +112,7 @@ SPDX-License-Identifier: MIT
 #ifdef IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
 #include "preprocess_spvir/PreprocessSPVIR.h"
 #include "preprocess_spvir/ConvertUserSemanticDecoratorOnFunctions.h"
+#include "preprocess_spvir/PromoteBools.cpp"
 #endif // IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
 #include "LowerInvokeSIMD.hpp"
 #include "Compiler/Optimizer/IGCInstCombiner/IGCInstructionCombining.hpp"
@@ -292,9 +294,13 @@ static void CommonOCLBasedPasses(
     CompilerOpts.ExcludeIRFromZEBinary =
         pContext->m_InternalOptions.ExcludeIRFromZEBinary;
 
+    CompilerOpts.EmitZeBinVISASections =
+        pContext->m_InternalOptions.EmitZeBinVISASections;
+
     IGCPassManager mpmSPIR(pContext, "Unify");
 #ifdef IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
     mpmSPIR.add(new PreprocessSPVIR());
+    mpmSPIR.add(new PromoteBools());
 #endif // IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
     mpmSPIR.add(new TypesLegalizationPass());
     mpmSPIR.add(new TargetLibraryInfoWrapperPass());
@@ -384,7 +390,7 @@ static void CommonOCLBasedPasses(
         FastMathFlags Mask;
         Mask.setFast();
         Mask.setNoSignedZeros(false);
-        mpm.add(new SetFastMathFlags(Mask));
+        mpm.add(new SetFastMathFlags(Mask, true));
 
         // Report undef references after setting func attribs for import linking
         mpm.add(new UndefinedReferencesPass());
@@ -408,6 +414,10 @@ static void CommonOCLBasedPasses(
         }
 
         mpm.add(new LowerInvokeSIMD());
+
+        // Run BreakConstantExpr right before LegalizeFunctionSignatures, since
+        // input module may contain call sites with bitcast constant expressions
+        mpm.add(new BreakConstantExpr());
 
         // Fix illegal argument/return types in function calls not already inlined.
         // This pass changes all illegal function signatures to be passed by pointer instead.
@@ -434,6 +444,9 @@ static void CommonOCLBasedPasses(
 
     if (IGC_IS_FLAG_ENABLED(EnableGASResolver))
     {
+        // InferAddressSpaces pass requires TTI analysis, but it doesn't initialize it
+        // as a dependency. Let's run it manually until IGC is switched to LLVM 14.
+        mpm.add(createTargetTransformInfoWrapperPass(TargetIRAnalysis()));
         // Run InferAddressSpaces pass first - to propagate named addrspaces
         // through elementary LLVM instructions, then run custom ResolveGAS
         // pass to handle IGC specific instructions, like builtins etc.
@@ -447,6 +460,7 @@ static void CommonOCLBasedPasses(
         {
             mpm.add(createLowerGPCallArg());
         }
+        mpm.add(createStaticGASResolution());
 
         mpm.add(createGASRetValuePropagatorPass());
 
@@ -502,9 +516,6 @@ static void CommonOCLBasedPasses(
     mpm.add(createDpasFuncsResolutionPass());
     mpm.add(createLSCFuncsResolutionPass());
 
-    // Run InlineLocals and GenericAddressDynamic together
-    mpm.add(new InlineLocalsResolution());
-
     mpm.add(new WGFuncResolution());
     mpm.add(new ResolveAggregateArguments());
     mpm.add(new ExtensionFuncsResolution());
@@ -513,6 +524,14 @@ static void CommonOCLBasedPasses(
     mpm.add(createDeadCodeEliminationPass());
 
     mpm.add(createBuiltinsConverterPass());
+
+    if (pContext->needsDivergentBarrierHandling())
+    {
+        mpm.add(createDivergentBarrierPass(nullptr));
+        mpm.add(new BreakConstantExpr());
+    }
+
+    mpm.add(new InlineLocalsResolution());
 
     // check for unsupported intrinsics
     mpm.add(new ErrorCheck());
@@ -570,7 +589,7 @@ static void CommonOCLBasedPasses(
 
     FastMathFlags Mask;
     Mask.setNoSignedZeros(true);
-    mpm.add(new SetFastMathFlags(Mask));
+    mpm.add(new SetFastMathFlags(Mask, true));
     mpm.add(new FixResourcePtr());
 
     if(isOptDisabled)

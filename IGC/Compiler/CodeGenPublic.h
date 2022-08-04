@@ -957,25 +957,26 @@ namespace IGC
         ~RetryManager();
 
         bool AdvanceState();
-        bool AllowLICM();
-        bool AllowPromotePrivateMemory();
-        bool AllowPreRAScheduler();
-        bool AllowVISAPreRAScheduler();
-        bool AllowCodeSinking();
-        bool AllowAddressArithmeticSinking();
-        bool AllowSimd32Slicing();
-        bool AllowLargeURBWrite();
-        bool AllowConstantCoalescing();
+        bool AllowLICM() const;
+        bool AllowPromotePrivateMemory() const;
+        bool AllowPreRAScheduler() const;
+        bool AllowVISAPreRAScheduler() const;
+        bool AllowCodeSinking() const;
+        bool AllowAddressArithmeticSinking() const;
+        bool AllowSimd32Slicing() const;
+        bool AllowLargeURBWrite() const;
+        bool AllowConstantCoalescing() const;
         void SetFirstStateId(int id);
-        bool IsFirstTry();
-        bool IsLastTry();
+        bool IsFirstTry() const;
+        bool IsLastTry() const;
         unsigned GetRetryId() const;
 
         void Enable();
         void Disable();
 
         void SetSpillSize(unsigned int spillSize);
-        unsigned int GetLastSpillSize();
+        unsigned int GetLastSpillSize() const;
+
         unsigned int numInstructions = 0;
         // For OCL the retry manager will work on per-kernel basis, that means
         // Disable() will disable only specific kernel. Other kernels still can
@@ -993,7 +994,7 @@ namespace IGC
         // save entry for given SIMD mode, to avoid recompile for next retry.
         void SaveSIMDEntry(SIMDMode simdMode, CShader* shader);
         CShader* GetSIMDEntry(SIMDMode simdMode);
-        bool AnyKernelSpills();
+        bool AnyKernelSpills() const;
 
         // Try to pickup the simd mode & kernel based on heuristics and fill
         // programOutput.  If returning true, then stop the further retry.
@@ -1005,24 +1006,30 @@ namespace IGC
         // ID rather than id 0.
         unsigned firstStateId;
 
-        unsigned getStateCnt();
-
-        /// internal knob to disable retry manager.
+        // internal knob to disable retry manager.
         bool enabled;
 
         unsigned lastSpillSize = 0;
 
         // cache the compiled kernel during retry
-        CShader* m_simdEntries[3];
+        struct CacheEntry
+        {
+            SIMDMode simdMode;
+            CShader* shader;
+        };
 
-        CShader* PickCSEntryForcedFromDriver(SIMDMode& simdMode,
-            unsigned char forcedSIMDModeFromDriver);
+        CacheEntry cache[3] = {
+            {SIMDMode::SIMD8, nullptr},
+            {SIMDMode::SIMD16, nullptr},
+            {SIMDMode::SIMD32, nullptr},
+        };
+
+        CacheEntry* GetCacheEntry(SIMDMode simdMode);
+
+        CShader* PickCSEntryForcedFromDriver(SIMDMode& simdMode, unsigned char forcedSIMDModeFromDriver);
         CShader* PickCSEntryByRegKey(SIMDMode& simdMode, ComputeShaderContext* cgCtx);
-        CShader* PickCSEntryEarly(SIMDMode& simdMode,
-            ComputeShaderContext* cgCtx);
+        CShader* PickCSEntryEarly(SIMDMode& simdMode, ComputeShaderContext* cgCtx);
         CShader* PickCSEntryFinally(SIMDMode& simdMode);
-        void FreeAllocatedMemForNotPickedCS(SIMDMode simdMode);
-        bool PickupCS(ComputeShaderContext* cgCtx);
     };
 
     /// this class adds intrinsic cache to LLVM context
@@ -1078,6 +1085,11 @@ namespace IGC
 
         SInstrTypes m_instrTypes;
         SInstrTypes m_instrTypesAfterOpts;
+        // The module contains global variables with private address space.
+        // When this is true, the flag "ForceGlobalMemoryAllocation" is enabled as a WA
+        bool m_hasGlobalInPrivateAddressSpace = false;
+
+        bool m_mustAllocatePrivateAsGlobalBuffer = false;
 
         /////  used for instruction statistic before/after pass
         int instrStat[TOTAL_TYPES][TOTAL_STAGE];
@@ -1250,9 +1262,10 @@ namespace IGC
         CompOptions& getCompilerOption();
         virtual void resetOnRetry();
         virtual uint32_t getNumThreadsPerEU() const;
-        virtual uint32_t getNumGRFPerThread() const;
+        virtual uint32_t getNumGRFPerThread(bool returnDefault = true) const;
         virtual bool forceGlobalMemoryAllocation() const;
         virtual bool allocatePrivateAsGlobalBuffer() const;
+        virtual bool noLocalToGenericOptionEnabled() const;
         virtual bool enableTakeGlobalAddress() const;
         virtual int16_t getVectorCoalescingControl() const;
         virtual uint32_t getPrivateMemoryMinimalSizePerThread() const;
@@ -1462,6 +1475,7 @@ namespace IGC
         SIMDMode GetMaxSIMDMode();
 
         float GetSpillThreshold() const;
+        bool CheckSLMLimit(SIMDMode simdMode);
     private:
         unsigned m_threadGroupSize_X;
         unsigned m_threadGroupSize_Y;
@@ -1747,12 +1761,14 @@ namespace IGC
             bool UseBindlessLegacyMode = true;
             bool EnableZEBinary = false;
             bool ExcludeIRFromZEBinary = false;
+            bool EmitZeBinVISASections = false;
             bool NoSpill = false;
             bool DisableNoMaskWA = false;
             bool IgnoreBFRounding = false;   // If true, ignore BFloat rounding when folding bf operations
             bool CompileOneKernelAtTime = false;
 
             // Generic address related
+            bool NoLocalToGeneric = false;
             bool ForceGlobalMemoryAllocation = false;
 
             // -1 : initial value that means it is not set from cmdline
@@ -1779,11 +1795,19 @@ namespace IGC
             // This option forces IGC to poison kernels using fp64
             // operations on platforms without HW support for fp64.
             bool EnableUnsupportedFP64Poisoning = false;
+            // Cache default. -1 menans not set (thus not used by igc);
+            // Valid values are defined as enum type LSC_L1_L3_CC in
+            //   visa\include\visa_igc_common_header.h, which are from
+            //   macro definitions in igc\common\igc_regkeys_enums_defs.h
+            int StoreCacheDefault = -1;
+            int LoadCacheDefault = -1;
 
             bool AllowRelocAdd = true;
 
             uint32_t IntelPrivateMemoryMinimalSizePerThread = 0;
             uint32_t IntelScratchSpacePrivateMemoryMinimalSizePerThread = 0;
+
+            bool EnableDivergentBarrierHandling = false;
 
             private:
                 void parseOptions(const char* IntOptStr);
@@ -1891,15 +1915,17 @@ namespace IGC
         bool isSPIRV() const;
         void setAsSPIRV();
         float getProfilingTimerResolution();
-        uint32_t getNumGRFPerThread() const override;
+        uint32_t getNumGRFPerThread(bool returnDefault = true) const override;
         uint32_t getNumThreadsPerEU() const override;
         bool forceGlobalMemoryAllocation() const override;
         bool allocatePrivateAsGlobalBuffer() const override;
+        bool noLocalToGenericOptionEnabled() const override;
         bool enableTakeGlobalAddress() const override;
         int16_t getVectorCoalescingControl() const override;
         uint32_t getPrivateMemoryMinimalSizePerThread() const override;
         uint32_t getIntelScratchSpacePrivateMemoryMinimalSizePerThread() const override;
         void failOnSpills();
+        bool needsDivergentBarrierHandling() const;
     private:
         llvm::DenseMap<llvm::Function*, std::string> m_hashes_per_kernel;
     };

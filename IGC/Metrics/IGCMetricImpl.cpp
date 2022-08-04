@@ -30,6 +30,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Instructions.h>
 #include <llvm/Support/Path.h>
 #include <llvm/IR/DebugInfo.h>
+#include <llvmWrapper/Support/TypeSize.h>
 #include "common/LLVMWarningsPop.hpp"
 
 //#define DEBUG_METRIC
@@ -412,8 +413,27 @@ namespace IGCMetrics
                         kernelInfo->hdcSends.countURB_WRITE_OWORD);
                     hdc_sends_stats_m->set_counturb_simd8_write(
                         kernelInfo->hdcSends.countURB_SIMD8_WRITE);
+                }
 
+                if (kernelInfo->spillFills.countBytesSpilled > 0)
+                {
+                    auto spillFill_m = func_m->mutable_spillfill_stats();
 
+                    spillFill_m->set_countbytesspilled(
+                        kernelInfo->spillFills.countBytesSpilled);
+
+                    for (auto spillOrderInstr : kernelInfo->spillFills.spillInstrOrder)
+                    {
+                        spillFill_m->add_spillinstrvisaid(spillOrderInstr);
+                    }
+                    for (auto fillOrderInstr : kernelInfo->spillFills.fillInstrOrder)
+                    {
+                        spillFill_m->add_fillinstrvisaid(fillOrderInstr);
+                    }
+                    for (auto virtualVar : kernelInfo->spillFills.virtualVars)
+                    {
+                        spillFill_m->add_virtualvars(virtualVar);
+                    }
                 }
             }
         }
@@ -426,6 +446,8 @@ namespace IGCMetrics
 #ifdef IGC_METRICS__PROTOBUF_ATTACHED
 
         this->pModule = (IGCLLVM::Module*)pModule;
+        fillInstrKindID = pModule->getMDKindID("FillInstr");
+        spillInstrKindID = pModule->getMDKindID("SpillInstr");
         for (auto func_i = pModule->begin(); func_i != pModule->end(); ++func_i)
         {
             llvm::Function& func = *func_i;
@@ -595,13 +617,21 @@ namespace IGCMetrics
         UpdateLoopsInfo();
         UpdateModelCost();
         UpdateFunctionArgumentsList();
+        UpdateInstructionStats();
 #endif
     }
 
-    void IGCMetricImpl::CollectDataFromDebugInfo(IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pVisaDbgInfo)
+    void IGCMetricImpl::CollectDataFromDebugInfo(llvm::Function* pFunc, IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pVisaDbgInfo)
     {
         if (!Enable()) return;
 #ifdef IGC_METRICS__PROTOBUF_ATTACHED
+
+        auto pDbgFunc = pFunc->getSubprogram();
+        if (!pDbgFunc || map_Func.find(pDbgFunc) == map_Func.end())
+        {
+            // For case if we have debugInfo not for user kernel
+            return;
+        }
 
         oclProgram.set_device((IGC_METRICS::DeviceType)
             pDebugInfo->m_pShader->m_Platform->getPlatformInfo().eProductFamily);
@@ -616,7 +646,6 @@ namespace IGCMetrics
             llvm::Function* pFunc = pListFuncData_it->first;
             IGC::VISAModule* vISAData = pListFuncData_it->second;
             const auto &VDI = vISAData->getVisaObjectDI(*pVisaDbgInfo);
-
 #ifdef DEBUG_METRIC
             std::printf("\nList of symbols:\n");
 
@@ -629,6 +658,7 @@ namespace IGCMetrics
                 it_dbgInfo->first->dump();
             }
 #endif
+            UpdateMem2RegStats(vISAData);
 
             const llvm::Value* pVal = nullptr;
 
@@ -721,12 +751,12 @@ namespace IGCMetrics
 
                 if (cvar == nullptr)
                 {
-                    // If not found check in whole shader data
-                    cvar = pDebugInfo->m_pShader->GetSymbol((llvm::Value*)pVal, false);
+                    // If not found, ignore
+                    continue;
                 }
 
-                    varInfo_m->set_size(cvar->GetSize());
-                    varInfo_m->set_type((IGC_METRICS::VarInfo_VarType)cvar->GetType());
+                varInfo_m->set_size(cvar->GetSize());
+                varInfo_m->set_type((IGC_METRICS::VarInfo_VarType)cvar->GetType());
 
                 auto fillRegister = [&](unsigned int reg)
                 {
@@ -911,6 +941,40 @@ namespace IGCMetrics
 #endif
     }
 
+    void IGCMetricImpl::UpdateVariable(llvm::Value* Org, llvm::Value* New)
+    {
+        if (!Enable()) return;
+#ifdef IGC_METRICS__PROTOBUF_ATTACHED
+        auto varData = GetVarData(Org);
+
+        if (varData)
+        {
+            auto MDDILocalVariable = varData->varDILocalVariable;
+            llvm::MetadataAsValue* MDValue = makeMDasVal(New);
+
+            llvm::Instruction* insertAfter = nullptr;
+            if (llvm::isa<llvm::Argument>(New))
+            {
+                auto firstInstr = &*llvm::dyn_cast<llvm::Argument>(New)
+                    ->getParent()->getEntryBlock().begin();
+
+                insertAfter = firstInstr;
+            }
+            else if (llvm::isa<llvm::Instruction>(New))
+            {
+                insertAfter = llvm::dyn_cast<llvm::Instruction>(New);
+            }
+            else
+            {
+                IGC_ASSERT_MESSAGE(false, "Unknown llvm type");
+            }
+
+            makeTrackCall(
+                funcTrackValue, { MDValue, MDDILocalVariable }, insertAfter);
+        }
+#endif
+    }
+
     void IGCMetricImpl::CollectMem2Reg(llvm::AllocaInst* pAllocaInst, IGC::StatusPrivArr2Reg status)
     {
         if (!Enable()) return;
@@ -918,6 +982,8 @@ namespace IGCMetrics
         IGC_METRICS::Function* func_metric = GetFuncMetric(pAllocaInst);
         if (func_metric)
         {
+            auto var_d = GetVarData(pAllocaInst);
+
             auto reg_stats = func_metric->mutable_local_reg_stats();
 
             if (status == IGC::StatusPrivArr2Reg::OK)
@@ -929,13 +995,69 @@ namespace IGCMetrics
             {
                 reg_stats->set_countprvarray2grfnotpromoted(
                     reg_stats->countprvarray2grfnotpromoted() + 1);
+
+                if (var_d)
+                {
+                    // As for now assuming that all store/load associated with
+                    // alloca will be treated as spill/fill
+                    std::vector<llvm::LoadInst*> fills;
+                    std::vector<llvm::StoreInst*> spills;
+
+                    std::function<void(llvm::User*,
+                        std::vector<llvm::LoadInst*>&,
+                        std::vector<llvm::StoreInst*>&)>
+                        lookForSpillFills
+                        = [&](llvm::User* enterUser,
+                            std::vector<llvm::LoadInst*>& fills,
+                            std::vector<llvm::StoreInst*>& spills)
+                    {
+                        for (auto user : enterUser->users())
+                        {
+                            if (auto load = llvm::dyn_cast<llvm::LoadInst>(user))
+                            {
+                                fills.push_back(load);
+                            }
+                            else if (auto load = llvm::dyn_cast<llvm::StoreInst>(user))
+                            {
+                                spills.push_back(load);
+                            }
+                            else if (llvm::isa<llvm::GetElementPtrInst>(user))
+                            {
+                                lookForSpillFills(user, fills, spills);
+                            }
+                        }
+                    };
+
+                    // Map in code any refrence to this spill/fills (for metrics)
+                    // by adding callinstr llvm.igc.metric.trackSpill/Fill in module for tracking
+                    lookForSpillFills(pAllocaInst, fills, spills);
+
+                    for (auto fill : fills)
+                    {
+                        MDNode* N = llvm::cast<DILocalVariable>(var_d->varDILocalVariable->getMetadata());
+                        fill->setMetadata(fillInstrKindID, N);
+                    }
+
+                    for (auto spill : spills)
+                    {
+                        MDNode* N = llvm::cast<DILocalVariable>(var_d->varDILocalVariable->getMetadata());
+                        spill->setMetadata(spillInstrKindID, N);
+                    }
+
+                    auto allocated = pAllocaInst->getAllocationSizeInBits(pModule->getDataLayout());
+
+                    auto func_m = GetFuncMetric(pAllocaInst);
+                    auto spillFill_m = func_m->mutable_spillfill_stats();
+                    // Add amount of bytes spilled
+                    spillFill_m->set_countbytesspilled(
+                        spillFill_m->countbytesspilled() +
+                        (int32_t)(allocated.getValueOr(IGCLLVM::getTypeSize(0)) / 8));
+                }
             }
 
-            IGC_METRICS::VarInfo* var_m = GetVarMetric(pAllocaInst);
-
-            if (var_m)
+            if (var_d)
             {
-                var_m->set_status_privarr2reg(
+                var_d->var_m->set_status_privarr2reg(
                     (IGC_METRICS::VarInfo_PrivArr2Reg)status);
             }
         }
@@ -943,6 +1065,69 @@ namespace IGCMetrics
     }
 
 #ifdef IGC_METRICS__PROTOBUF_ATTACHED
+
+    class CollectSpillFills : public llvm::InstVisitor<CollectSpillFills>
+    {
+        IGCMetricImpl* metric;
+        IGC::VISAModule* CurrentVISA;
+
+    public:
+
+        CollectSpillFills(IGCMetricImpl* metric, IGC::VISAModule* CurrentVISA)
+        {
+            this->metric = metric;
+            this->CurrentVISA = CurrentVISA;
+        }
+
+        void visitLoadInst(llvm::LoadInst& instr)
+        {
+            auto spillMD = instr.getMetadata(metric->fillInstrKindID);
+            if (spillMD != nullptr)
+            {
+                // Some instructions dosen't have visa offset
+                // that means the instruction is a dead code
+                if (CurrentVISA->HasVisaOffset(&instr))
+                {
+                    auto func_m = metric->GetFuncMetric(&instr);
+                    auto spillFill_m = func_m->mutable_spillfill_stats();
+
+                    spillFill_m->set_countfillinstr(spillFill_m->countfillinstr() + 1);
+
+                    // Add spill instruction to metrics
+                    spillFill_m->add_fillinstrvisaid(CurrentVISA->GetVisaOffset(&instr));
+                }
+            }
+        }
+
+        void visitStoreInst(llvm::StoreInst& instr)
+        {
+            auto fillMD = instr.getMetadata(metric->spillInstrKindID);
+            if (fillMD != nullptr)
+            {
+                // Some instructions dosen't have visa offset
+                // that means the instruction is a dead code
+                if (CurrentVISA->HasVisaOffset(&instr))
+                {
+                    auto func_m = metric->GetFuncMetric(&instr);
+                    auto spillFill_m = func_m->mutable_spillfill_stats();
+
+                    spillFill_m->set_countspillinstr(spillFill_m->countspillinstr() + 1);
+
+                    // Add spill instruction to metrics
+                    spillFill_m->add_spillinstrvisaid(CurrentVISA->GetVisaOffset(&instr));
+                }
+            }
+        }
+    };
+
+    void IGCMetricImpl::UpdateMem2RegStats(IGC::VISAModule* CurrentVISA)
+    {
+        // Now if we have vISA kernel code ready, then we can map
+        // spill/fills from IGC to vISA-ID
+        CollectSpillFills metricPass(this, CurrentVISA);
+
+        metricPass.visit((llvm::Function*)(CurrentVISA->GetEntryFunction()));
+    }
 
     void IGCMetricImpl::UpdateFunctionArgumentsList()
     {
@@ -983,7 +1168,7 @@ namespace IGCMetrics
                         {
                             func_arg_m->set_name(arg->getName().str());
                         }
-                        func_arg_m->set_compilesize(arg->getType()->getPrimitiveSizeInBits());
+                        func_arg_m->set_compilesize((int32_t)arg->getType()->getPrimitiveSizeInBits());
                         func_arg_m->set_type(IGC_METRICS::KernelArg_ArgumentType::KernelArg_ArgumentType_IMPLICIT);
                     }
                 }
@@ -1062,16 +1247,113 @@ namespace IGCMetrics
 
     void IGCMetricImpl::UpdateLoopsInfo()
     {
-        //TODO
     }
 
-    class CollectDataMetrics : public llvm::InstVisitor<CollectDataMetrics>
+    class CollectInstrData : public llvm::InstVisitor<CollectInstrData>
     {
         IGCMetricImpl* metric;
 
     public:
 
-        CollectDataMetrics(IGCMetricImpl* metric)
+        CollectInstrData(IGCMetricImpl* metric)
+        {
+            this->metric = metric;
+        }
+
+        void visitUnaryOperator(llvm::UnaryOperator& unaryOpInst)
+        {
+            AddArithmeticinstCount(unaryOpInst);
+        }
+
+        void visitBinaryOperator(llvm::BinaryOperator& binaryOpInst)
+        {
+            AddArithmeticinstCount(binaryOpInst);
+        }
+
+        void visitCallInst(llvm::CallInst& callInst)
+        {
+            /*
+            if (GenIntrinsicInst* CI = llvm::dyn_cast<GenIntrinsicInst>(&callInst))
+            {
+                switch (CI->getIntrinsicID())
+                {
+                default:
+                    break;
+                }
+            }*/
+            if (IntrinsicInst* CI = llvm::dyn_cast<IntrinsicInst>(&callInst))
+            {
+                switch (CI->getIntrinsicID())
+                {
+                case Intrinsic::log:
+                case Intrinsic::log2:
+                case Intrinsic::log10:
+                case Intrinsic::cos:
+                case Intrinsic::sin:
+                case Intrinsic::exp:
+                case Intrinsic::exp2:
+                    AddTranscendentalFuncCount(callInst);
+                    break;
+                case Intrinsic::sqrt:
+                case Intrinsic::pow:
+                case Intrinsic::floor:
+                case Intrinsic::ceil:
+                case Intrinsic::trunc:
+                case Intrinsic::maxnum:
+                case Intrinsic::minnum:
+                    AddArithmeticinstCount(callInst);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+
+        void AddTranscendentalFuncCount(llvm::Instruction& instr)
+        {
+            // Transcendental functions includes:
+            // 1.exponential function
+            // 2.logarithm
+            // 3.trigonometric functions
+            auto func_m = metric->GetFuncMetric(&instr);
+
+            if (func_m)
+            {
+                auto instr_stats_m = func_m->mutable_instruction_stats();
+                instr_stats_m->set_counttranscendentalfunc(
+                    instr_stats_m->counttranscendentalfunc() + 1
+                );
+            }
+        }
+
+        void AddArithmeticinstCount(llvm::Instruction& instr)
+        {
+            auto func_m = metric->GetFuncMetric(&instr);
+
+            if (func_m)
+            {
+                auto instr_stats_m = func_m->mutable_instruction_stats();
+                instr_stats_m->set_countarithmeticinst(
+                    instr_stats_m->countarithmeticinst() + 1
+                );
+            }
+        }
+    };
+
+    void IGCMetricImpl::UpdateInstructionStats()
+    {
+        CollectInstrData metricPass(this);
+
+        metricPass.visit(pModule);
+    }
+
+    class CollectFuncData : public llvm::InstVisitor<CollectFuncData>
+    {
+        IGCMetricImpl* metric;
+
+    public:
+
+        CollectFuncData(IGCMetricImpl* metric)
         {
             this->metric = metric;
         }
@@ -1139,7 +1421,7 @@ namespace IGCMetrics
 
     void IGCMetricImpl::GetFunctionData(IGC_METRICS::Function* func_m, llvm::Function& func)
     {
-        CollectDataMetrics metricPass(this);
+        CollectFuncData metricPass(this);
 
         metricPass.visit(func);
 
@@ -1189,18 +1471,48 @@ namespace IGCMetrics
         return instCount;
     }
 
+    llvm::CallInst* IGCMetricImpl::makeTrackCall(
+        const char* const trackCall,
+        ArrayRef<Value*> Args,
+        llvm::Instruction* insertAfter)
+    {
+        auto& ctx = pModule->getContext();
+        auto atrr = llvm::AttributeList::get(ctx, {
+            {0, llvm::Attribute::get(ctx, llvm::Attribute::AttrKind::OptimizeNone)},
+            {1, llvm::Attribute::get(ctx, llvm::Attribute::AttrKind::NoInline)},
+            {2, llvm::Attribute::get(ctx, llvm::Attribute::AttrKind::ReadNone)},
+            {3, llvm::Attribute::get(ctx, llvm::Attribute::AttrKind::NoAlias)} });
+
+        auto funcType = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(ctx),
+            { llvm::Type::getMetadataTy(ctx), llvm::Type::getMetadataTy(ctx) }, false);
+
+        auto funcVal = pModule->getOrInsertFunction(trackCall, funcType, atrr);
+
+        llvm::Function* func = llvm::cast<llvm::Function>(funcVal);
+
+        return llvm::CallInst::Create(func, Args, "", insertAfter->getNextNode());
+    }
+
     IGC_METRICS::VarInfo* IGCMetricImpl::AddVarMetric(llvm::DbgVariableIntrinsic* pInstr)
     {
+        int DILocalVariableIndex = 1;
+        if (llvm::isa<llvm::DbgValueInst>(pInstr) &&
+            pInstr->arg_size() == 4)
+        {
+            DILocalVariableIndex = 2;
+        }
+
         llvm::MDNode* pNode = nullptr;
         llvm::Value* value = nullptr;
         llvm::MetadataAsValue* MDValue = llvm::dyn_cast<llvm::MetadataAsValue>(pInstr->getArgOperand(0));
-        llvm::MetadataAsValue* MDDILocalVariable = llvm::dyn_cast<llvm::MetadataAsValue>(pInstr->getArgOperand(1));
+        llvm::MetadataAsValue* MDDILocalVariable = llvm::dyn_cast<llvm::MetadataAsValue>(pInstr->getArgOperand(DILocalVariableIndex));
         IGC_METRICS::VarInfo* var_m = nullptr;
 
         if (MDValue != nullptr)
         {
             llvm::ValueAsMetadata* vAsMD = llvm::dyn_cast<llvm::ValueAsMetadata>(MDValue->getMetadata());
-            pNode = pInstr->getVariable();
+            pNode = llvm::cast<DILocalVariable>(MDDILocalVariable->getMetadata());
             if (vAsMD != nullptr &&
                 vAsMD->getValue() != nullptr)
             {
@@ -1230,37 +1542,26 @@ namespace IGCMetrics
                 {
                     auto func_arg_m = func_m->add_arguments();
                     func_arg_m->set_name(varName);
-                    func_arg_m->set_compilesize(value->getType()->getPrimitiveSizeInBits());
+                    func_arg_m->set_compilesize((int32_t)value->getType()->getPrimitiveSizeInBits());
                     func_arg_m->set_type(IGC_METRICS::KernelArg_ArgumentType::KernelArg_ArgumentType_EXPLICIT);
                 }
 
                 // The user variables are identified by the MDAsVal,
                 // because they are unique in whole module and aren't
                 // recreated/changed during compilation of shader (it doesn't change pointer)
-                map_Var[MDDILocalVariable] = var_m;
+                map_Var[MDDILocalVariable].var_m = var_m;
+
+                // Map in code any refrence to this variable (for metrics)
+                // by adding callinstr llvm.igc.metric.trackValue in module for tracking
+                makeTrackCall(
+                    funcTrackValue, {MDValue, MDDILocalVariable}, pInstr);
+
+                map_Var[MDDILocalVariable].varDILocalVariable = MDDILocalVariable;
             }
             else
             {
-                var_m = map_Var[MDDILocalVariable];
+                var_m = map_Var[MDDILocalVariable].var_m;
             }
-
-            // Map in code any refrence to this variable (for metrics)
-            // by adding callinstr llvm.igc.metric.trackValue in module for tracking
-            llvm::AttributeList atrr;
-            atrr.addAttribute(pModule->getContext(), 0, llvm::Attribute::AttrKind::OptimizeNone);
-            atrr.addAttribute(pModule->getContext(), 1, llvm::Attribute::AttrKind::NoInline);
-            atrr.addAttribute(pModule->getContext(), 2, llvm::Attribute::AttrKind::ReadNone);
-            atrr.addAttribute(pModule->getContext(), 3, llvm::Attribute::AttrKind::NoAlias);
-
-            auto funcType = llvm::FunctionType::get(
-                llvm::Type::getVoidTy(pModule->getContext()),
-                { llvm::Type::getMetadataTy(pModule->getContext()), llvm::Type::getMetadataTy(pModule->getContext()) }, false);
-
-            auto funcVal = pModule->getOrInsertFunction(funcTrackValue, funcType, atrr);
-
-            llvm::Function* func = llvm::cast<llvm::Function>(funcVal);
-
-            llvm::CallInst::Create(func, { MDValue, MDDILocalVariable }, "", pInstr);
 
             return var_m;
         }
@@ -1269,6 +1570,12 @@ namespace IGCMetrics
     }
 
     IGC_METRICS::VarInfo* IGCMetricImpl::GetVarMetric(llvm::Value* pValue)
+    {
+        auto data = GetVarData(pValue);
+        return data ? data->var_m : nullptr;
+    }
+
+    struct VarData* IGCMetricImpl::GetVarData(llvm::Value* pValue)
     {
         map_Var.begin();
         // iterate over all user variables which we found
@@ -1297,7 +1604,7 @@ namespace IGCMetrics
                         // Found tracker which looks at defined user variable
                         if (vAsMD && vAsMD->getValue() == pValue)
                         {
-                            return map_Var[tracker];
+                            return &map_Var[tracker];
                         }
                     }
                 }
@@ -1439,6 +1746,15 @@ namespace IGCMetrics
         llvm::sys::path::append(fileNamebuf, fileName);
         std::string fileNameStr(fileNamebuf.begin(), fileNamebuf.end());
         return fileNameStr;
+    }
+
+    llvm::MetadataAsValue* IGCMetricImpl::makeMDasVal(llvm::Value* Value)
+    {
+        llvm::MetadataAsValue* MDValue = llvm::MetadataAsValue::get(
+            Value->getContext(),
+            llvm::ValueAsMetadata::get(Value)
+        );
+        return MDValue;
     }
 
 #endif

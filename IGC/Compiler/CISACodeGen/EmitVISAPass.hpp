@@ -74,7 +74,7 @@ public:
     void Floor(const SSource& source, const DstModifier& modifier);
     void Mad(const SSource sources[3], const DstModifier& modifier);
     void Lrp(const SSource sources[3], const DstModifier& modifier);
-    void Cmp(llvm::CmpInst::Predicate pred, const SSource sources[2], const DstModifier& modifier);
+    void Cmp(llvm::CmpInst::Predicate pred, const SSource sources[2], const DstModifier& modifier, uint8_t clearTagMask = 0);
     void Sub(const SSource[2], const DstModifier& mofidier);
     void Xor(const SSource[2], const DstModifier& modifier);
     void FDiv(const SSource[2], const DstModifier& modifier);
@@ -99,13 +99,15 @@ public:
     void Alu(e_opcode opCode, const SSource sources[N], const DstModifier& modifier);
 
     void BinaryUnary(llvm::Instruction* inst, const  SSource source[2], const DstModifier& modifier);
-    void CmpBoolOp(llvm::BinaryOperator* inst,
+    void CmpBoolOp(Pattern* cmpPattern,
+        llvm::BinaryOperator* inst,
         llvm::CmpInst::Predicate predicate,
         const  SSource source[2],
         const SSource& bitSource,
         const DstModifier& modifier);
     void emitAluConditionMod(Pattern* aluPattern, llvm::Instruction* alu, llvm::CmpInst* cmp, int aluOprdNum);
 
+    void EmitGenericPointersCmp(llvm::Instruction* inst, const SSource source[2], const DstModifier& modifier, uint8_t clearTagMask);
     void EmitAluIntrinsic(llvm::CallInst* I, const SSource source[2], const DstModifier& modifier);
     void EmitSimpleAlu(llvm::Instruction* inst, const SSource source[2], const DstModifier& modifier);
     void EmitSimpleAlu(llvm::Instruction* inst, CVariable* dst, CVariable* src0, CVariable* src1);
@@ -150,8 +152,6 @@ public:
     void emitSymbolRelocation(llvm::Function& F);
 
     void emitOutput(llvm::GenIntrinsicInst* inst);
-    void emitGS_SGV(llvm::SGVIntrinsic* inst);
-    void emitSampleOffset(llvm::GenIntrinsicInst* inst);
 
     // TODO: unify the functions below and clean up
     void emitStore(llvm::StoreInst* inst, llvm::Value* varOffset, llvm::ConstantInt* immOffset);
@@ -203,21 +203,8 @@ public:
         bool& payloadCovered
     );
 
-    template <typename T>
-    bool interceptRenderTargetWritePayloadCoalescing(
-        T* inst,
-        CVariable** src,
-        CVariable*& source0Alpha,
-        CVariable*& oMaskOpnd,
-        CVariable*& outputDepthOpnd,
-        CVariable*& vStencilOpnd,
-        llvm::DenseMap<llvm::Value*, CVariable**>& valueToVariableMap);
-
     // message emit functions
-    void emitRenderTargetWrite(llvm::RTWritIntrinsic* inst, bool fromRet);
-    void emitDualBlendRT(llvm::RTDualBlendSourceIntrinsic* inst, bool fromRet);
     void emitSimdLaneId(llvm::Instruction* inst);
-    void emitPatchInstanceId(llvm::Instruction* inst);
     void emitSimdSize(llvm::Instruction* inst);
     void emitSimdShuffle(llvm::Instruction* inst);
     void emitCrossInstanceMov(const SSource& source, const DstModifier& modifier);
@@ -232,10 +219,6 @@ public:
     void emitSimdMediaBlockWrite(llvm::Instruction* inst);
     void emitMediaBlockIO(const llvm::GenIntrinsicInst* inst, bool isRead);
     void emitMediaBlockRectangleRead(llvm::Instruction* inst);
-    void emitURBWrite(llvm::GenIntrinsicInst* inst);
-    void emitURBReadCommon(llvm::GenIntrinsicInst* inst, const QuadEltUnit globalOffset,
-        llvm::Value* const perSlotOffset);
-    void emitURBRead(llvm::GenIntrinsicInst* inst);
     void emitSampleInstruction(llvm::SampleIntrinsic* inst);
     void emitLdInstruction(llvm::Instruction* inst);
     void emitInfoInstruction(llvm::InfoIntrinsic* inst);
@@ -336,16 +319,13 @@ public:
     void emitFastClear(llvm::LoadInst* inst);
     void emitFastClearSend(llvm::Instruction* pInst);
     void setRovCacheCtrl(llvm::GenIntrinsicInst* inst);
+    llvm::Optional<LSC_CACHE_OPTS>
+        setCacheOptionsForConstantBufferLoads(Instruction& inst) const;
     bool useRasterizerOrderedByteAddressBuffer(llvm::GenIntrinsicInst* inst);
     void emitUniformAtomicCounter(llvm::GenIntrinsicInst* pInst);
-    void emitRenderTargetRead(llvm::GenIntrinsicInst* inst);
 
     void emitDiscard(llvm::Instruction* inst);
-    void emitInitDiscardMask(llvm::GenIntrinsicInst* inst);
-    void emitUpdateDiscardMask(llvm::GenIntrinsicInst* inst);
-    void emitGetPixelMask(llvm::GenIntrinsicInst* inst);
 
-    void emitInput(llvm::Instruction* inst);
     void emitcycleCounter(llvm::Instruction* inst);
     void emitSetDebugReg(llvm::Instruction* inst);
     void emitInsert(llvm::Instruction* inst);
@@ -358,32 +338,12 @@ public:
     void emitDiscardBranch(llvm::BranchInst* br, const SSource& cond);
     void emitAluNoModifier(llvm::GenIntrinsicInst* inst);
 
-    void emitSGV(llvm::SGVIntrinsic* inst);
-    void emitPSSGV(llvm::GenIntrinsicInst* inst);
-    void emitCSSGV(llvm::GenIntrinsicInst* inst);
-    void getCoarsePixelSize(CVariable* destination, const uint component, bool isCodePatchCandidate = false);
-    void getPixelPosition(CVariable* destination, const uint component, bool isCodePatchCandidate = false);
-    void emitPixelPosition(llvm::GenIntrinsicInst* inst);
-    void emitPhaseOutput(llvm::GenIntrinsicInst* inst);
-    void emitPhaseInput(llvm::GenIntrinsicInst* inst);
-
-    void emitPSInput(llvm::Instruction* inst);
-    void emitPSInputMADHalf(llvm::Instruction* inst);
-    void emitPSInputPln(llvm::Instruction* inst);
-    void emitPSInputCst(llvm::Instruction* inst);
-    void emitEvalAttribute(llvm::GenIntrinsicInst* inst);
-    void emitInterpolate(llvm::GenIntrinsicInst* inst);
-    void emitInterpolate2(llvm::GenIntrinsicInst* inst);
-    void emitInterpolant(llvm::GenIntrinsicInst* inst);
 
     void emitGradientX(const SSource& source, const DstModifier& modifier);
     void emitGradientY(const SSource& source, const DstModifier& modifier);
     void emitGradientXFine(const SSource& source, const DstModifier& modifier);
     void emitGradientYFine(const SSource& source, const DstModifier& modifier);
 
-    void emitHSTessFactors(llvm::Instruction* pInst);
-    void emitHSSGV(llvm::GenIntrinsicInst* inst);
-    void emitBindlessShaderSGV(llvm::GenIntrinsicInst* inst);
     void emitf32tof16_rtz(llvm::GenIntrinsicInst* inst);
     void emitfitof(llvm::GenIntrinsicInst* inst);
     void emitFPOrtz(llvm::GenIntrinsicInst* inst);
@@ -392,8 +352,6 @@ public:
     void emitftoi(llvm::GenIntrinsicInst* inst);
     void emitCtlz(const SSource& source);
 
-    void emitDSInput(llvm::Instruction* pInst);
-    void emitDSSGV(llvm::GenIntrinsicInst* inst);
 
     // VME
     void emitVMESendIME(llvm::GenIntrinsicInst* inst);
@@ -504,7 +462,7 @@ public:
     LSC_CACHE_OPTS translateLSCCacheControlsFromValue(
         llvm::Value *value, bool isLoad) const;
     LSC_CACHE_OPTS translateLSCCacheControlsFromMetadata(
-        llvm::Instruction* inst, bool isLoad) const;
+        llvm::Instruction* inst, bool isLoad, bool isTGM = 0) const;
     struct LscMessageFragmentInfo {
         LSC_DATA_ELEMS fragElem;
         int            fragElemCount;
@@ -635,7 +593,7 @@ public:
     {
         if (llvm::CallInst * pCall = llvm::dyn_cast<llvm::CallInst>(pInst))
         {
-            if (op < pCall->getNumArgOperands())
+            if (op < IGCLLVM::getNumArgOperands(pCall))
             {
                 return pInst->getOperand(op);
             }
@@ -674,7 +632,6 @@ public:
     CVariable* GetExecutionMask();
     CVariable* GetExecutionMask(CVariable* &vecMaskVar);
     CVariable* GetHalfExecutionMask();
-    CVariable* GetDispatchMask();
     CVariable* UniformCopy(CVariable* var, bool doSub = false);
     CVariable* UniformCopy(CVariable* var, CVariable*& LaneOffset, CVariable* eMask = nullptr, bool doSub = false);
 
@@ -747,6 +704,16 @@ public:
     // Otherwise the access is direct.
     bool IsIndirectAccess(llvm::Value* value);
 
+    // Checks if scalar kernel argument was used as pointer for stateless access. Example:
+    //
+    // kernel void f(long a) {
+    //   ((int*) a)[0] += 1;
+    // }
+    //
+    // Matcher fails if scalar argument is combined with pointer (scalar argument used as
+    // offset for pointer).
+    void CheckAccessFromScalar(llvm::Value* pointer);
+
     CVariable* GetSrcVariable(const SSource& source, bool fromConstPool = false);
     void SetSourceModifiers(unsigned int sourceIndex, const SSource& source);
 
@@ -783,6 +750,9 @@ private:
 
     llvm::DenseMap<llvm::Instruction*, bool> instrMap;
 
+    typedef llvm::SmallVector<llvm::Argument*, 2> ScalarArgList;
+    llvm::DenseMap<llvm::Instruction*, std::unique_ptr<ScalarArgList>> m_visitedScalarArgInst;
+
     // Current rounding Mode
     //   As RM of FPCvtInt and FP could be different, there
     //   are two fields to keep track of their current values.
@@ -813,8 +783,6 @@ private:
     ERoundingMode m_roundingMode_FP;
     ERoundingMode m_roundingMode_FPCvtInt;
 
-    EPreemptionMode m_preemptionMode;
-
     uint m_currentBlock = (uint) -1;
 
     bool m_currFuncHasSubroutine = false;
@@ -839,6 +807,9 @@ private:
 
     void emitScan(llvm::Value* Src, IGC::WaveOps Op,
         bool isInclusiveScan, llvm::Value* Mask, bool isQuad);
+
+    const ScalarArgList* GetAccessFromScalar(llvm::Instruction* inst);
+    void MarkAsAccessFromScalar(llvm::Function* func, llvm::Argument* arg);
 
     // Cached per lane offset variables. This is a per basic block data
     // structure. For each entry, the first item is the scalar type size in
@@ -889,8 +860,6 @@ private:
     void SetRoundingMode_FPCvtInt(ERoundingMode RM_FPCvtInt);
     bool setRMExplicitly(llvm::Instruction* inst);
     void ResetRoundingMode(llvm::Instruction* inst);
-
-    void SetPreemptionMode(EPreemptionMode newPreemptionMode);
 
     // returns true if the instruction does not care about the rounding mode settings
     bool ignoreRoundingMode(llvm::Instruction* inst) const;

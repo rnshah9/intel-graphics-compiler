@@ -53,10 +53,45 @@ std::string vISA::ToSymbol(MsgOp op)
     case MsgOp::ATOMIC_AND:    return "atomic_and";
     case MsgOp::ATOMIC_XOR:    return "atomic_xor";
     case MsgOp::ATOMIC_OR:     return "atomic_or";
+    case MsgOp::EOT:           return "eot";
+    case MsgOp::FENCE:         return "fence";
+    case MsgOp::BARRIER:       return "barrier";
+    case MsgOp::NBARRIER:      return "named_barrier";
     default:
         break;
     }
     return "???";
+}
+
+MsgOp vISA::ConvertSamplerOpToMsgOp (VISASampler3DSubOpCode op) {
+    switch (op) {
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE:
+            return MsgOp::SAMPLE;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_B:
+            return MsgOp::SAMPLE_B;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_L:
+            return MsgOp::SAMPLE_L;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_C:
+            return MsgOp::SAMPLE_C;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_D:
+            return MsgOp::SAMPLE_D;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_B_C:
+            return MsgOp::SAMPLE_B_C;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_L_C:
+            return MsgOp::SAMPLE_L_C;
+        case VISASampler3DSubOpCode::VISA_3D_GATHER4:
+            return MsgOp::GATHER4;
+        case VISASampler3DSubOpCode::VISA_3D_GATHER4_C:
+            return MsgOp::GATHER4_C;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_D_C:
+            return MsgOp::SAMPLE_D_C;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_LZ:
+            return MsgOp::SAMPLE_LZ;
+        case VISASampler3DSubOpCode::VISA_3D_SAMPLE_C_LZ:
+            return MsgOp::SAMPLE_C_LZ;
+        default:
+            return MsgOp::INVALID;
+    }
 }
 
 MsgOp vISA::ConvertLSCOpToMsgOp(LSC_OP op) {
@@ -107,19 +142,49 @@ MsgOp vISA::ConvertLSCOpToMsgOp(LSC_OP op) {
             return MsgOp::ATOMIC_XOR;
         case LSC_OP::LSC_ATOMIC_OR:
             return MsgOp::ATOMIC_OR;
+        case LSC_OP::LSC_FENCE:
+            return MsgOp::FENCE;
         default:
             return MsgOp::INVALID;
     }
 }
 
+uint32_t vISA::GetRenderTargetMsgOpEncoding(MsgOp m) {
+    switch(m) {
+        case MsgOp::RTREAD: return 2;
+        case MsgOp::RTWRITE: return 6;
+        case MsgOp::RTDSWRITE: return 5;
+        default: MUST_BE_TRUE(false, "Invalid msg op");
+    }
+    return 0;
+}
+
+uint32_t vISA::GetSamplerMsgOpEncoding(MsgOp m) {
+    switch(m) {
+        case MsgOp::SAMPLE: return 0;
+        case MsgOp::SAMPLE_B: return 1;
+        case MsgOp::SAMPLE_L: return 2;
+        case MsgOp::SAMPLE_C: return 3;
+        case MsgOp::SAMPLE_D: return 4;
+        case MsgOp::SAMPLE_B_C: return 5;
+        case MsgOp::SAMPLE_L_C: return 6;
+        case MsgOp::SAMPLE_D_C: return 20;
+        case MsgOp::SAMPLE_LZ: return 24;
+        case MsgOp::SAMPLE_C_LZ: return 25;
+        case MsgOp::GATHER4: return 8;
+        case MsgOp::GATHER4_C: return 16;
+        default: MUST_BE_TRUE(false, "Invalid msg op");
+    }
+    return 0;
+}
+
 uint32_t vISA::GetMsgOpEncoding(MsgOp m) {
-    // source -- https://gfxspecs.intel.com/Predator/Home/Index/71890
     switch(m) {
         case MsgOp::LOAD: return 0;
-        case MsgOp::LOAD_STRIDED: return 2;
+        case MsgOp::LOAD_QUAD: return 2;
         case MsgOp::LOAD_BLOCK2D: return 3;
         case MsgOp::STORE: return 4;
-        case MsgOp::STORE_STRIDED: return 6;
+        case MsgOp::STORE_QUAD: return 6;
         case MsgOp::STORE_BLOCK2D: return 7;
         case MsgOp::ATOMIC_IINC: return 8;
         case MsgOp::ATOMIC_IDEC: return 9;
@@ -140,6 +205,12 @@ uint32_t vISA::GetMsgOpEncoding(MsgOp m) {
         case MsgOp::ATOMIC_AND: return 24;
         case MsgOp::ATOMIC_XOR: return 25;
         case MsgOp::ATOMIC_OR: return 26;
+        case MsgOp::READ_STATE_INFO: return 30;
+        case MsgOp::FENCE:     return 31;
+        //
+        case MsgOp::EOT:      return 0x0;
+        case MsgOp::BARRIER:  return 0x4;
+        case MsgOp::NBARRIER: return 0x5;
         // TODO: other ops
         default: MUST_BE_TRUE(false, "Invalid msg op");
     }
@@ -183,6 +254,19 @@ uint32_t vISA::GetDataSizeEncoding(DataSize ds) {
         case DataSize::D8U32: return 4;
         case DataSize::D16U32: return 5;
         default: MUST_BE_TRUE(false, "invalid data size");
+    }
+    return 0;
+}
+
+size_t vISA::GetDataSizeInBytes(DataSize ds) {
+    switch(ds) {
+    case DataSize::D8: return 1;
+    case DataSize::D16: return 2;
+    case DataSize::D32: return 4;
+    case DataSize::D64: return 8;
+    case DataSize::D8U32: return 4;
+    case DataSize::D16U32: return 4;
+    default: MUST_BE_TRUE(false, "invalid encoding");
     }
     return 0;
 }
@@ -258,6 +342,32 @@ uint32_t vISA::GetVecElemsEncoding(VecElems ve) {
     default: MUST_BE_TRUE(false, "invalid vector elements");
     }
     return 0;
+}
+
+size_t vISA::GetNumVecElems(VecElems ve) {
+    switch(ve) {
+    case VecElems::V1: return 1;
+    case VecElems::V2: return 2;
+    case VecElems::V3: return 3;
+    case VecElems::V4: return 4;
+    case VecElems::V8: return 8;
+    case VecElems::V16: return 16;
+    case VecElems::V32: return 32;
+    case VecElems::V64: return 64;
+    default: MUST_BE_TRUE(false, "invalid encoding");
+    }
+    return 0;
+}
+
+// data chmask
+size_t vISA::GetNumVecElemsQuad(int chMask) {
+    size_t vecElems = 0;
+    if (chMask & DataChMask::X) vecElems++;
+    if (chMask & DataChMask::Y) vecElems++;
+    if (chMask & DataChMask::Z) vecElems++;
+    if (chMask & DataChMask::W) vecElems++;
+
+    return vecElems;
 }
 
 // Addr size type
@@ -1563,6 +1673,9 @@ size_t G4_SendDescRaw::getDstLenBytes() const
 
 size_t G4_SendDescRaw::getSrc1LenBytes() const
 {
+    if (isLscDescriptor) {
+        return src1Len * irb.getGRFSize();
+    }
     if (isScratchRW()) {
         return 32 * getScratchRWSize(); // HWords
     }

@@ -220,8 +220,7 @@ bool GenericAddressDynamicResolution::visitLoadStoreInst(Instruction& I)
     }
 
     if (pointerAddressSpace == ADDRESS_SPACE_GENERIC) {
-        if((m_ctx->allocatePrivateAsGlobalBuffer() || !m_needPrivateBranches) &&
-            !m_needLocalBranches)
+        if(!m_needPrivateBranches && !m_needLocalBranches)
         {
             resolveGASWithoutBranches(I, pointerOperand);
         }
@@ -294,14 +293,14 @@ void GenericAddressDynamicResolution::resolveGAS(Instruction& I, Value* pointerO
     // GAS needs to resolve to private only if
     //     1) private is NOT allocated in global space; and
     //     2) there is a cast from private to GAS.
-    bool needPrivateBranch = !(m_ctx->allocatePrivateAsGlobalBuffer()) || m_needPrivateBranches;
+    bool needPrivateBranch = m_needPrivateBranches;
     bool needLocalBranch = m_needLocalBranches;
 
     auto createBlock = [&](const Twine& BlockName, const Twine& LoadName, IGC::ADDRESS_SPACE addressSpace, Value*& load)
     {
         BasicBlock* BB = BasicBlock::Create(I.getContext(), BlockName, convergeBlock->getParent(), convergeBlock);
         builder.SetInsertPoint(BB);
-        PointerType* ptrType = pointerType->getElementType()->getPointerTo(addressSpace);
+        PointerType* ptrType = pointerType->getPointerElementType()->getPointerTo(addressSpace);
         Value* ptr = builder.CreateAddrSpaceCast(pointerOperand, ptrType);
 
         if (LoadInst* LI = dyn_cast<LoadInst>(&I))
@@ -378,7 +377,7 @@ void GenericAddressDynamicResolution::resolveGASWithoutBranches(Instruction& I, 
 
     Value* nonLocalLoad = nullptr;
 
-    PointerType* ptrType = pointerType->getElementType()->getPointerTo(ADDRESS_SPACE_GLOBAL);
+    PointerType* ptrType = pointerType->getPointerElementType()->getPointerTo(ADDRESS_SPACE_GLOBAL);
     Value* globalPtr = builder.CreateAddrSpaceCast(pointerOperand, ptrType);
 
     if (LoadInst* LI = dyn_cast<LoadInst>(&I))
@@ -412,7 +411,7 @@ bool GenericAddressDynamicResolution::visitIntrinsicCall(CallInst& I)
     if ((funcName == "__builtin_IB_to_private") || (funcName == "__builtin_IB_to_local")
         || (funcName == "__builtin_IB_to_global"))
     {
-        IGC_ASSERT(I.getNumArgOperands() == 1);
+        IGC_ASSERT(IGCLLVM::getNumArgOperands(&I) == 1);
         Value* arg = I.getArgOperand(0);
         PointerType* dstType = dyn_cast<PointerType>(I.getType());
         IGC_ASSERT( dstType != nullptr );
@@ -458,7 +457,7 @@ bool GenericAddressDynamicResolution::visitIntrinsicCall(CallInst& I)
         // If Block
         {
             IRBuilder<> ifBuilder(ifBlock);
-            PointerType* ptrType = pointerType->getElementType()->getPointerTo(targetAS);
+            PointerType* ptrType = pointerType->getPointerElementType()->getPointerTo(targetAS);
             newPtr = ifBuilder.CreateAddrSpaceCast(arg, ptrType);
             ifBuilder.CreateBr(convergeBlock);
         }

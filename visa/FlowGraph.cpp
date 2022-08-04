@@ -46,6 +46,79 @@ SPDX-License-Identifier: MIT
 
 using namespace vISA;
 
+//
+// Helper class for processGoto to merge join's execution masks.
+// For example,
+//    (p1) goto (8|M8) label
+//         ....
+//    (p2) goto (4|M4) label
+//         ....
+//    label:
+//         join (16|M0)
+// Merge( (8|M8) and (4|M4)) will be (16|M0)!
+//
+// Normally, we don't see this kind of code. (Visa will generate macro sequence like
+// the following.) If it happens, we have to match join's execMask to all of its gotos.
+// we do so by tracking excution mask (execSize + mask offset).
+//
+//        (p) goto (8|M8) L
+//        ......
+//        L:
+//            join (8|M8)            // M8, not M0
+//
+class ExecMaskInfo
+{
+    uint8_t ExecSize;    // 1|2|4|8|16|32
+    uint8_t MaskOffset;  // 0|4|8|12|16|20|24|28
+
+    void mergeEM(ExecMaskInfo& aEM)
+    {
+        // The new execMask should cover at least [left, right)
+        const uint32_t left = std::min(MaskOffset, aEM.getMaskOffset());
+        const uint32_t right = std::max(MaskOffset + ExecSize, aEM.getMaskOffset() + aEM.getExecSize());
+        // Divide 32 channels into 8 quarters
+        uint32_t lowQuarter = left / 4;
+        uint32_t highQuarter = (right - 1) / 4;
+        if (lowQuarter < 4 && highQuarter >= 4)
+        {
+            // (32, M0)
+            ExecSize = 32;
+            MaskOffset = 0;
+        }
+        else if (lowQuarter < 2 && highQuarter >= 2)
+        {
+            // (16, M0|M16)
+            ExecSize = 16;
+            MaskOffset = 0;
+        }
+        else if (lowQuarter < 6 && highQuarter >= 6)
+        {
+            // (16, M16)
+            ExecSize = 16;
+            MaskOffset = 16;
+        }
+        // at this time, the range resides in one of [Q0,Q1], [Q2,Q3], [Q4,Q5], and [Q6,Q7].
+        else
+        {
+            // (4|8, ...)
+            ExecSize = (lowQuarter != highQuarter ? 8 : 4);
+            MaskOffset = left;
+        }
+    }
+
+public:
+    ExecMaskInfo() : ExecSize(0), MaskOffset(0) {};
+    ExecMaskInfo(uint8_t aE, uint8_t aM) : ExecSize(aE), MaskOffset(aM) {}
+
+    uint8_t getExecSize() const { return ExecSize; }
+    uint8_t getMaskOffset() const { return MaskOffset; }
+
+    void mergeExecMask(G4_ExecSize aExSize, uint8_t aMaskOffset)
+    {
+        ExecMaskInfo anotherEM{ aExSize, aMaskOffset };
+        mergeEM(anotherEM);
+    }
+};
 
 void GlobalOpndHashTable::HashNode::insert(uint16_t newLB, uint16_t newRB)
 {
@@ -422,7 +495,7 @@ bool FlowGraph::matchBranch(int &sn, INST_LIST& instlist, INST_LIST_ITER &it)
         assert(inst->asCFInst()->getJip() == nullptr && "IF should not have a label at this point");
 
         // create if_label
-        if_label = builder->createLocalBlockLabel("if");
+        if_label = builder->createLocalBlockLabel("ifJip");
         inst->asCFInst()->setJip(if_label);
 
         // look for else/endif
@@ -449,7 +522,7 @@ bool FlowGraph::matchBranch(int &sn, INST_LIST& instlist, INST_LIST_ITER &it)
                 it1++;
 
                 // add endif label to "else"
-                else_label = builder->createLocalBlockLabel("else");
+                else_label = builder->createLocalBlockLabel("elseJip");
                 inst->asCFInst()->setJip(else_label);
 
                 // insert if-else label
@@ -533,6 +606,8 @@ bool FlowGraph::matchBranch(int &sn, INST_LIST& instlist, INST_LIST_ITER &it)
 //
 void FlowGraph::preprocess(INST_LIST& instlist)
 {
+    // It is easier to add WA before control-flow is build for partial HW
+    // fix to fused call HW bug.
 
     std::unordered_set<G4_Label*> labels;   // label inst we have seen so far
 
@@ -916,6 +991,12 @@ void FlowGraph::constructFlowGraph(INST_LIST& instlist)
 
     pKernel->dumpToFile("after.CFGConstruction");
 
+    // Do call WA before return/exit processing.
+    if (builder->hasFusedEU() && builder->getuint32Option(vISA_fusedCallWA) == 2)
+    {
+        hasGoto |= convertPredCall(labelMap);
+    }
+
     removeRedundantLabels();
 
     pKernel->dumpToFile("after.RemoveRedundantLabels");
@@ -1086,7 +1167,7 @@ void FlowGraph::handleWait()
                 }
                 if (!sunk)
                 {
-                    auto fenceInst = builder->createSLMFence();
+                    auto fenceInst = builder->createSLMFence(nullptr);
                     auto sendInst = fenceInst->asSendInst();
                     if (sendInst != NULL)
                     {
@@ -3039,9 +3120,10 @@ G4_BB* FlowGraph::getUniqueReturnBlock()
 
 /*
 * Insert a join at the beginning of this basic block, immediately after the label
-* If a join is already present, nothing will be done
+* If a join is already present, make sure the join will cover the given 'execSize' and
+* 'maskOffset'.
 */
-void FlowGraph::insertJoinToBB(G4_BB* bb, G4_ExecSize execSize, G4_Label* jip)
+void FlowGraph::insertJoinToBB(G4_BB* bb, G4_ExecSize execSize, G4_Label* jip, uint8_t maskOffset)
 {
     MUST_BE_TRUE(bb->size() > 0, "empty block");
     INST_LIST_ITER iter = bb->begin();
@@ -3055,7 +3137,8 @@ void FlowGraph::insertJoinToBB(G4_BB* bb, G4_ExecSize execSize, G4_Label* jip)
     if (iter == bb->end())
     {
         // insert join at the end
-        G4_INST* jInst = builder->createInternalCFInst(NULL, G4_join, execSize, jip, NULL, InstOpt_NoOpt);
+        G4_InstOption instMask = G4_INST::offsetToMask(execSize, maskOffset, builder->hasNibCtrl());
+        G4_INST* jInst = builder->createInternalCFInst(NULL, G4_join, execSize, jip, NULL, instMask);
         bb->push_back(jInst, false);
     }
     else
@@ -3064,22 +3147,34 @@ void FlowGraph::insertJoinToBB(G4_BB* bb, G4_ExecSize execSize, G4_Label* jip)
 
         if (secondInst->opcode() == G4_join)
         {
-            if (execSize > secondInst->getExecSize())
+            G4_ExecSize origExSize = secondInst->getExecSize();
+            uint8_t origMaskOffset = (uint8_t)secondInst->getMaskOffset();
+            ExecMaskInfo joinEM{ origExSize, origMaskOffset };
+            joinEM.mergeExecMask(execSize, maskOffset);
+            if (joinEM.getExecSize() > origExSize)
             {
-                secondInst->setExecSize(execSize);
+                secondInst->setExecSize(G4_ExecSize{ joinEM.getExecSize() });
+            }
+            if (joinEM.getMaskOffset() != origMaskOffset)
+            {
+                G4_InstOption nMask =
+                    G4_INST::offsetToMask(joinEM.getExecSize(), joinEM.getMaskOffset(), builder->hasNibCtrl());
+                secondInst->setMaskOption(nMask);
             }
         }
         else
         {
-            G4_INST* jInst = builder->createInternalCFInst(NULL, G4_join, execSize, jip, NULL, InstOpt_NoOpt);
+            G4_InstOption instMask = G4_INST::offsetToMask(execSize, maskOffset, builder->hasNibCtrl());
+            G4_INST* jInst = builder->createInternalCFInst(NULL, G4_join, execSize, jip, NULL, instMask);
             bb->insertBefore(iter, jInst, false);
         }
     }
 }
 
-typedef std::pair<G4_BB*, G4_ExecSize> BlockSizePair;
+// For tracking execMask information of join.
+typedef std::pair<G4_BB*, ExecMaskInfo> BlockSizePair;
 
-static void addBBToActiveJoinList(std::list<BlockSizePair>& activeJoinBlocks, G4_BB* bb, G4_ExecSize execSize)
+static void addBBToActiveJoinList(std::list<BlockSizePair>& activeJoinBlocks, G4_BB* bb, G4_ExecSize execSize, uint8_t maskOff)
 {
     // add goto target to list of active blocks that need a join
     std::list<BlockSizePair>::iterator listIter;
@@ -3089,22 +3184,20 @@ static void addBBToActiveJoinList(std::list<BlockSizePair>& activeJoinBlocks, G4
         if (aBB->getId() == bb->getId())
         {
             // block already in list, update exec size if necessary
-            if (execSize > (*listIter).second)
-            {
-                (*listIter).second = execSize;
-            }
+            ExecMaskInfo& EM = (*listIter).second;
+            EM.mergeExecMask(execSize, maskOff);
             break;
         }
         else if (aBB->getId() > bb->getId())
         {
-            activeJoinBlocks.insert(listIter, BlockSizePair(bb, execSize));
+            (void) activeJoinBlocks.insert(listIter, BlockSizePair(bb, ExecMaskInfo(execSize, maskOff)));
             break;
         }
     }
 
     if (listIter == activeJoinBlocks.end())
     {
-        activeJoinBlocks.push_back(BlockSizePair(bb, execSize));
+        activeJoinBlocks.push_back(BlockSizePair(bb, ExecMaskInfo(execSize, maskOff)));
     }
 }
 
@@ -3228,13 +3321,18 @@ void FlowGraph::convertGotoToJmpi(G4_INST *gotoInst)
 *    if it is uniform and it does not overlap with another divergent goto.  All uniform
 *    backward gotos may be converted into scalar jumps.
 *
+*  This function assumes **scalar control flow**: meaning that given any goto inst,
+*  its execsize should cover all active lanes used for all BBs dominated by this goto.
+*
 *  - This function does *not* alter the CFG.
 *  - This function does *not* consider SCF (structured control flow), as a well-formed
 *    vISA program should not have overlapped goto and structured CF instructions.
-*
 */
 void FlowGraph::processGoto(bool HasSIMDCF)
 {
+    // For a given loop (StartBB, EndBB) (EndBB->StartBB is a backedge), this function
+    // return a BB in which an out-of-loop join will be inserted.
+    //
     // For all BBs in [StartBB, EndBB) (including StartBB, but not including EndBB) that
     // jump after EndBB (forward jump), return the earliest (closest to EndBB). If no such
     // BB, return nullptr.
@@ -3244,7 +3342,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
         const G4_BB* StartBB,
         const G4_BB* EndBB) -> G4_BB*
     {
-        // Existing active joins must be considered. For example,
+        // Existing active joins (passed in as "activeJoins") must be considered. For example,
         //    goto L0  (non-uniform)
         //    ...
         //  Loop:
@@ -3257,9 +3355,40 @@ void FlowGraph::processGoto(bool HasSIMDCF)
         //     ...
         //  L1:
         // Since 'goto L0' is non-uniform, 'goto L1' must be tranlated into goto and a join must
-        // be inserted at L1.  If goto L0 is not considered (no active join at L0) and 'goto L1' can
-        // be converted into jmpi (thus no join will be inserted at L1, which is wrong.
-        std::list<BlockSizePair> tmpActiveJoins(activeJoins);
+        // be inserted at L1.  This "goto L0" is outside of the loop (outside of [StartBB, EndBB)).
+        // If it is not considered, this function thinks there is no active joins at L0 and 'goto L1'
+        // would be converted into jmpi incorrectly.
+
+        // list of BB that will have a join at the begin of each BB.
+        // The list is in the order of the increasing BB id.
+        std::list<G4_BB*> tmpActiveJoins;
+        // initialize tmpActiveJoins with activeJoins
+        for (auto II = activeJoins.begin(), IE = activeJoins.end(); II != IE; ++II)
+        {
+            tmpActiveJoins.push_back(II->first);
+        }
+
+        auto orderedInsert = [](std::list<G4_BB*>& tmpActiveJoins, G4_BB* aBB)
+        {
+            auto II = tmpActiveJoins.begin(), IE = tmpActiveJoins.end();
+            for (; II != IE; ++II)
+            {
+                G4_BB* bb = *II;
+                if (bb->getId() == aBB->getId())
+                {
+                    break;
+                }
+                else if (bb->getId() > aBB->getId())
+                {
+                    tmpActiveJoins.insert(II, aBB);
+                    break;
+                }
+            }
+            if (II == IE)
+            {
+                tmpActiveJoins.push_back(aBB);
+            }
+        };
 
         const G4_BB* bb = StartBB;
         while (bb != EndBB)
@@ -3268,7 +3397,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
             if (!tmpActiveJoins.empty())
             {
                 // adjust active join lists if a join is reached.
-                if (bb == tmpActiveJoins.front().first)
+                if (bb == tmpActiveJoins.front())
                 {
                     tmpActiveJoins.pop_front();
                 }
@@ -3288,7 +3417,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
             G4_BB* targetBB = currBB->Succs.back();
             assert(lastInst->asCFInst()->getUip() == targetBB->getLabel());
             if (lastInst->asCFInst()->isUniform() &&
-                (tmpActiveJoins.empty() || tmpActiveJoins.front().first->getId() >= targetBB->getId()))
+                (tmpActiveJoins.empty() || tmpActiveJoins.front()->getId() >= targetBB->getId()))
             {
                 // Non-crossing uniform goto will be jmpi, and thus no join needed.
                 //
@@ -3305,12 +3434,11 @@ void FlowGraph::processGoto(bool HasSIMDCF)
                 //  it must be translated to goto, not jmpi.  Thus, join is needed at L1.
                 continue;
             }
-            // Here, use SIMD1 as execsize does not matter here.
-            addBBToActiveJoinList(tmpActiveJoins, targetBB, g4::SIMD1);
+            orderedInsert(tmpActiveJoins, targetBB);
         }
 
         // Need to remove join at EndBB if present (looking for joins after EndBB)
-        if (!tmpActiveJoins.empty() && tmpActiveJoins.front().first == EndBB)
+        if (!tmpActiveJoins.empty() && tmpActiveJoins.front() == EndBB)
         {
             tmpActiveJoins.pop_front();
         }
@@ -3320,7 +3448,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
             // no new join
             return nullptr;
         }
-        return tmpActiveJoins.front().first;
+        return tmpActiveJoins.front();
     };
 
     // list of active blocks where a join needs to be inserted, sorted in lexical order
@@ -3340,7 +3468,9 @@ void FlowGraph::processGoto(bool HasSIMDCF)
             {
                 // This block is the target of one or more forward goto,
                 // or the fall-thru of a backward goto, needs to insert a join
-                G4_ExecSize execSize = activeJoinBlocks.front().second;
+                ExecMaskInfo& EM = activeJoinBlocks.front().second;
+                uint8_t eSize = EM.getExecSize();
+                uint8_t mOff = EM.getMaskOffset();
                 G4_Label* joinJIP = NULL;
 
                 activeJoinBlocks.pop_front();
@@ -3351,7 +3481,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
                     joinJIP = joinBlock->getLabel();
                 }
 
-                insertJoinToBB(bb, execSize, joinJIP);
+                insertJoinToBB(bb, G4_ExecSize{eSize}, joinJIP, mOff);
             }
         }
 
@@ -3392,7 +3522,8 @@ void FlowGraph::processGoto(bool HasSIMDCF)
                     // join) within the loop body will has its JIP set to this join.
                     if (G4_BB* afterLoopJoinBB = getEarliestJmpOutBB(activeJoinBlocks, bb, predBB))
                     {
-                        addBBToActiveJoinList(activeJoinBlocks, afterLoopJoinBB, eSize);
+                        // conservatively use maskoffset = 0.
+                        addBBToActiveJoinList(activeJoinBlocks, afterLoopJoinBB, eSize, 0);
                     }
                 }
                 else
@@ -3406,7 +3537,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
                     // add join to the fall-thru BB
                     if (G4_BB* fallThruBB = predBB->getPhysicalSucc())
                     {
-                        addBBToActiveJoinList(activeJoinBlocks, fallThruBB, eSize);
+                        addBBToActiveJoinList(activeJoinBlocks, fallThruBB, eSize, (uint8_t)lastInst->getMaskOffset());
                         lastInst->asCFInst()->setJip(fallThruBB->getLabel());
                     }
                 }
@@ -3433,7 +3564,7 @@ void FlowGraph::processGoto(bool HasSIMDCF)
                 // set goto JIP to the first active block
                 G4_ExecSize eSize = lastInst->getExecSize() > g4::SIMD1 ?
                     lastInst->getExecSize() : pKernel->getSimdSize();
-                addBBToActiveJoinList(activeJoinBlocks, gotoTargetBB, eSize);
+                addBBToActiveJoinList(activeJoinBlocks, gotoTargetBB, eSize, (uint8_t)lastInst->getMaskOffset());
                 G4_BB* joinBlock = activeJoinBlocks.front().first;
                 if (lastInst->getExecSize() == g4::SIMD1)
                 {   // For simd1 goto, convert it to a goto with the right execSize.
@@ -3936,7 +4067,7 @@ void FlowGraph::addSaveRestorePseudoDeclares(IR_Builder& builder)
     for (auto callSite : callSites)
     {
         const char* nameBase = "VCA_SAVE";  // sizeof(nameBase) = 9, including ending 0
-        const int maxIdLen = 3;
+        const int maxIdLen = 10;
         const char* name = builder.getNameString(mem, sizeof(nameBase) + maxIdLen, "%s_%d", nameBase, i);
         G4_Declare* VCA = builder.createDeclareNoLookup(name, G4_GRF, builder.numEltPerGRF<Type_UD>(), builder.kernel.getCallerSaveLastGRF(), Type_UD);
         name = builder.getNameString(mem, 50, "SA0_%d", i);
@@ -4755,6 +4886,137 @@ bool FlowGraph::convertJmpiToGoto()
         }
     }
     return Changed;
+}
+
+// Changes a predicated call to a unpredicated call like the following:
+//    BB:
+//      (p) call (execSize) ...
+//    NextBB:
+//
+// It is changed to
+//    BB:
+//      p1 = simdsize > execSize ? (p & ((1<<execSize) - 1)) : p
+//      (~p1) goto (simdsize) target_lbl
+//    newCallBB:
+//         call (execSize) ...
+//    newNextBB:
+//    NextBB:
+//  where target_lbl is newTargetBB.
+//
+bool FlowGraph::convertPredCall(std::unordered_map<G4_Label*, G4_BB*>& aLabelMap)
+{
+    bool changed = false;
+    // Add BB0 and BB1 into the subroutine in which aAnchorBB is.
+    auto updateSubroutineTab = [&](G4_BB* aAnchorBB, G4_BB* BB0, G4_BB* BB1)
+    {
+        for (auto MI : subroutines)
+        {
+            std::vector<G4_BB*>& bblists = MI.second;
+            auto BI = std::find(bblists.begin(), bblists.end(), aAnchorBB);
+            if (BI == bblists.end())
+            {
+                continue;
+            }
+            bblists.push_back(BB0);
+            bblists.push_back(BB1);
+        }
+    };
+
+    const G4_ExecSize SimdSize = pKernel->getSimdSize();
+    G4_Type PredTy = SimdSize > 16 ? Type_UD : Type_UW;
+    auto NextBI = BBs.begin();
+    for (auto BI = NextBI, BE = BBs.end(); BI != BE; BI = NextBI)
+    {
+        ++NextBI;
+        G4_BB* BB = *BI;
+        if (BB->empty())
+        {
+            continue;
+        }
+        G4_BB* NextBB = (NextBI == BE ? nullptr : *NextBI);
+
+        G4_INST* Inst = BB->back();
+        G4_Predicate* Pred = Inst->getPredicate();
+        if (!(Pred && (Inst->isCall() || Inst->isFCall())))
+        {
+            continue;
+        }
+
+        const bool hasFallThru = (NextBB && BB->Succs.size() >= 1 && BB->Succs.front() == NextBB);
+
+        G4_BB* newCallBB = createNewBBWithLabel("predCallWA", Inst->getLineNo(), Inst->getCISAOff());
+        insert(NextBI, newCallBB);
+        G4_Label* callBB_lbl = newCallBB->getLabel();
+        assert(callBB_lbl);
+        aLabelMap.insert(std::make_pair(callBB_lbl, newCallBB));
+
+        G4_BB* targetBB = createNewBBWithLabel("predCallWA", Inst->getLineNo(), Inst->getCISAOff());
+        insert(NextBI, targetBB);
+        G4_Label* target_lbl = targetBB->getLabel();
+        aLabelMap.insert(std::make_pair(target_lbl, targetBB));
+
+        // relink call's succs
+        if (hasFallThru)
+        {
+            removePredSuccEdges(BB, NextBB);
+        }
+        auto SI = BB->Succs.begin(), SE = BB->Succs.end();
+        while (SI != SE)
+        {
+            G4_BB* Succ = *SI;
+            ++SI;
+            removePredSuccEdges(BB, Succ);
+            addPredSuccEdges(newCallBB, Succ, false);
+        }
+        addPredSuccEdges(BB, newCallBB, true);
+        addPredSuccEdges(BB, targetBB, false);
+        addPredSuccEdges(newCallBB, targetBB, true);
+        if (hasFallThru)
+        {
+            addPredSuccEdges(targetBB, NextBB, true);
+        }
+
+        // delink call inst
+        BB->pop_back();
+
+        G4_Predicate* newPred;
+        const G4_ExecSize ExecSize = Inst->getExecSize();
+        if (SimdSize == ExecSize)
+        {
+            // negate predicate
+            newPred = builder->createPredicate(
+                Pred->getState() == PredState_Plus ? PredState_Minus : PredState_Plus,
+                Pred->getBase()->asRegVar(), 0, Pred->getControl());
+        }
+        else
+        {
+            // Common dst and src0 operand for flag.
+            G4_Type oldPredTy = ExecSize > 16 ? Type_UD : Type_UW;
+            G4_Declare* newDcl = builder->createTempFlag(PredTy == Type_UD ? 2 : 1);
+            auto pDst = builder->createDst(newDcl->getRegVar(), 0, 0, 1, PredTy);
+            auto pSrc0 = builder->createSrc(Pred->getBase(), 0, 0, builder->getRegionScalar(), oldPredTy);
+            auto pSrc1 = builder->createImm((1 << ExecSize) - 1, PredTy);
+            auto pInst = builder->createBinOp(
+                G4_and, g4::SIMD1, pDst, pSrc0, pSrc1,
+                InstOpt_M0 | InstOpt_WriteEnable, false);
+            BB->push_back(pInst);
+
+            newPred = builder->createPredicate(
+                Pred->getState() == PredState_Plus ? PredState_Minus : PredState_Plus,
+                newDcl->getRegVar(), 0, Pred->getControl());
+        }
+
+        G4_INST* gotoInst = builder->createGoto(newPred, SimdSize, target_lbl, InstOpt_NoOpt, false);
+        BB->push_back(gotoInst);
+
+        Inst->setPredicate(nullptr);
+        newCallBB->push_back(Inst);
+
+        updateSubroutineTab(BB, newCallBB, targetBB);
+        changed = true;
+    }
+    // if changed is true, it means goto has been added.
+    return changed;
 }
 
 void FlowGraph::print(std::ostream& OS) const

@@ -42,7 +42,6 @@ SPDX-License-Identifier: MIT
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/StringSaver.h"
-#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetOptions.h"
@@ -51,6 +50,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Transforms/Scalar.h"
 
 #include "llvmWrapper/Option/OptTable.h"
+#include "llvmWrapper/Support/TargetRegistry.h"
 #include "llvmWrapper/Target/TargetMachine.h"
 
 #include "Probe/Assertion.h"
@@ -245,6 +245,9 @@ static GenXBackendOptions createBackendOptions(const vc::CompileOptions &Opts) {
   BackendOpts.LoopUnrollThreshold = Opts.ForceLoopUnrollThreshold;
   BackendOpts.IgnoreLoopUnrollThresholdOnPragma =
       Opts.IgnoreLoopUnrollThresholdOnPragma;
+
+  if (Opts.InteropSubgroupSize)
+    BackendOpts.InteropSubgroupSize = Opts.InteropSubgroupSize;
 
   BackendOpts.DisableLiveRangesCoalescing =
       getDefaultOverridableFlag(Opts.DisableLRCoalescingMode, false);
@@ -772,6 +775,18 @@ static Error fillInternalOptions(const opt::ArgList &InternalOptions,
     Opts.HasL3FlushForGlobal = true;
   if (InternalOptions.hasArg(OPT_vc_ignore_loop_unroll_threshold_on_pragma))
     Opts.IgnoreLoopUnrollThresholdOnPragma = true;
+
+  if (opt::Arg *A = InternalOptions.getLastArg(OPT_vc_interop_subgroup_size)) {
+    StringRef Val = A->getValue();
+    auto MaybeSize = StringSwitch<Optional<unsigned>>(Val)
+                         .Case("8", 8)
+                         .Case("16", 16)
+                         .Case("32", 32)
+                         .Default(None);
+    if (!MaybeSize)
+      return makeOptionError(*A, InternalOptions, /*IsInternal=*/true);
+    Opts.InteropSubgroupSize = MaybeSize.getValue();
+  }
 
   if (opt::Arg *A = InternalOptions.getLastArg(OPT_binary_format)) {
     StringRef Val = A->getValue();

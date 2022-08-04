@@ -3268,14 +3268,6 @@ void SpillManagerGRF::insertSpillRangeCode(
         return;
     }
 
-    if (builder_->getOption(vISA_DoSplitOnSpill))
-    {
-        // if spilled inst is copy of original variable to it's split variable
-        // then simply remove the instruction.
-        if (LoopVarSplit::removeFromPreheader(&gra, spillDcl, bb, spilledInstIter))
-            return;
-    }
-
     auto checkRMWNeeded = [this, spilledRegion]()
     {
         return noRMWNeeded.find(spilledRegion) == noRMWNeeded.end();
@@ -3552,22 +3544,6 @@ void SpillManagerGRF::insertFillGRFRangeCode(
     auto dstRegion = inst->getDst();
     G4_INST* fillSendInst = nullptr;
     auto spillDcl = filledRegion->getTopDcl()->getRootDeclare();
-
-    if (builder_->getOption(vISA_DoSplitOnSpill))
-    {
-        // if spilled inst is copy of split variable to it's spilled variable
-        // then simply remove the instruction.
-        //
-        // if inst is:
-        // (W) mov (8|M0) SPLIT1    V10
-        //
-        // and SPLIT1 is marked as spilled then don't insert spill code for it.
-        // V10 is guaranteed to be spilled already so there is no point spilling
-        // SPLIT1. we simply remove above instruction and any fill emitted to load
-        // V10 and return.
-        if (LoopVarSplit::removeFromLoopExit(&gra, spillDcl, bb, filledInstIter))
-            return;
-    }
 
     auto sisIt = scalarImmSpill.find(spillDcl);
     if (sisIt != scalarImmSpill.end())
@@ -4541,6 +4517,20 @@ bool SpillManagerGRF::insertSpillFillCode(
         return false;
     }
 
+    if (kernel->getOption(vISA_DoSplitOnSpill))
+    {
+        // remove all spilled splits
+        for (const LiveRange* lr : *spilledLRs_)
+        {
+            auto dcl = lr->getDcl();
+            // check whether spilled variable is one of split vars
+            if (gra.splitResults.find(dcl) == gra.splitResults.end())
+                continue;
+
+            LoopVarSplit::removeAllSplitInsts(&gra, dcl);
+        }
+    }
+
     // Insert spill/fill code for all basic blocks.
     updateRMWNeeded();
     FlowGraph& fg = kernel->fg;
@@ -4984,14 +4974,15 @@ void GlobalRA::saveRestoreA0(G4_BB * bb)
 
     auto a0SSOMove = [this]()
     {
-        // shr (1) a0.2   SSO   0x4 {NM}
         // SSO is stored in r126.7
         auto dst = builder.createDstRegRegion(builder.getBuiltinA0Dot2(), 1);
         auto SSOsrc = builder.createSrc(builder.getSpillSurfaceOffset()->getRegVar(),
             0, 0, builder.getRegionScalar(), Type_UD);
-        auto imm4 = builder.createImm(4, Type_UD);
-
-        return builder.createBinOp(G4_shr, g4::SIMD1, dst, SSOsrc, imm4, InstOpt_WriteEnable, false);
+        {
+            // shr (1) a0.2   SSO   0x4 {NM}
+            auto imm4 = builder.createImm(4, Type_UD);
+            return builder.createBinOp(G4_shr, g4::SIMD1, dst, SSOsrc, imm4, InstOpt_WriteEnable, false);
+        }
     };
 
     auto isPrologOrEpilog = [this](G4_INST* inst)
@@ -5189,6 +5180,11 @@ void GlobalRA::expandSpillLSC(G4_BB* bb, INST_LIST_ITER& instIt)
     LSC_OP op = LSC_STORE;
     LSC_SFID lscSfid = LSC_UGM;
     LSC_CACHE_OPTS cacheOpts{ LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT };
+    LSC_L1_L3_CC store_cc = (LSC_L1_L3_CC)builder->getuint32Option(vISA_lscSpillStoreCCOverride);
+    if (store_cc != LSC_CACHING_DEFAULT)
+    {
+        cacheOpts = convertLSCLoadStoreCacheControlEnum(store_cc, false);
+    }
 
     LSC_ADDR addrInfo;
     addrInfo.type = LSC_ADDR_TYPE_SS; //Scratch memory
@@ -5228,7 +5224,8 @@ void GlobalRA::expandSpillLSC(G4_BB* bb, INST_LIST_ITER& instIt)
             dataShape,
             surface,
             0,
-            1);
+            1,
+            LdStAttrs::SCRATCH_SURFACE);
 
         auto sendInst = builder->createLscSendInst(
             nullptr,
@@ -5294,6 +5291,11 @@ void GlobalRA::expandFillLSC(G4_BB* bb, INST_LIST_ITER& instIt)
     LSC_OP op = LSC_LOAD;
     LSC_SFID lscSfid = LSC_UGM;
     LSC_CACHE_OPTS cacheOpts{ LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT };
+    LSC_L1_L3_CC ld_cc = (LSC_L1_L3_CC)builder->getuint32Option(vISA_lscSpillLoadCCOverride);
+    if (ld_cc != LSC_CACHING_DEFAULT)
+    {
+        cacheOpts = convertLSCLoadStoreCacheControlEnum(ld_cc, true);
+    }
 
     LSC_ADDR addrInfo;
     addrInfo.type = LSC_ADDR_TYPE_SS; //Scratch memory
@@ -5331,7 +5333,8 @@ void GlobalRA::expandFillLSC(G4_BB* bb, INST_LIST_ITER& instIt)
             dataShape,
             surface,
             responseLength,
-            1);
+            1,
+            LdStAttrs::SCRATCH_SURFACE);
 
         auto sendInst = builder->createLscSendInst(
             nullptr,

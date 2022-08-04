@@ -749,6 +749,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                                     src->asSrcRegRegion()->getSubRegOff(),
                                     src->asSrcRegRegion()->getRegion(),
                                     src->getType());
+                            replacedArgSrc->asSrcRegRegion()->setModifier(src->asSrcRegRegion()->getModifier());
                             inst->setSrc(replacedArgSrc, i);
                         }
                     }
@@ -758,6 +759,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                     G4_Declare* topDcl = dst->getTopDcl();
                     if (!topDcl) continue;
                     G4_Declare* rootDcl = topDcl->getRootDeclare();
+
                     if (calleeBuilder->isPreDefRet(rootDcl))
                     {
                         G4_DstRegRegion *replacedRetDst = callerBuilder->createDst(
@@ -826,6 +828,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                                     src->asSrcRegRegion()->getSubRegOff(),
                                     src->asSrcRegRegion()->getRegion(),
                                     src->getType());
+                            replacedRetSrc->asSrcRegRegion()->setModifier(src->asSrcRegRegion()->getModifier());
                             inst->setSrc(replacedRetSrc, i);
                         }
                     }
@@ -847,7 +850,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                 auto getPointerOffset = [&](G4_INST *inst, long long offset)
                 {
                     auto execSize = static_cast<int>(inst->getExecSize());
-                    assert(execSize == 1);
+                    auto typeSize = inst->getSrc(0)->getTypeSize() * 8;
                     switch(inst->opcode())
                     {
                         case G4_mov:
@@ -855,7 +858,13 @@ void CISA_IR_Builder::LinkTimeOptimization(
                                 return offset;
                             }
                         case G4_add:
+                        case G4_addc:
                             {
+                                assert(execSize == 1);
+                                if (typeSize == 32 && inst->opcode() == G4_add)
+                                {
+                                    return offset;
+                                }
                                 assert(inst->getSrc(1)->isImm());
                                 return offset + inst->getSrc(1)->asImm()->getImm();
                             }
@@ -926,7 +935,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                     }
                     auto instIt = defInst[src->getTopDcl()];
                     G4_INST *inst = *instIt;
-                    if (static_cast<int>(inst->getExecSize() != 1))
+                    if (static_cast<int>(inst->getExecSize() > 2))
                     {
                         return;
                     }
@@ -964,7 +973,8 @@ void CISA_IR_Builder::LinkTimeOptimization(
                         {
                             long long offset = stackPointers[rootDcl];
                             if (inst->opcode() == G4_mov ||
-                                inst->opcode() == G4_add)
+                                inst->opcode() == G4_add ||
+                                inst->opcode() == G4_addc)
                             {
                                 auto execSize = static_cast<int>(inst->getExecSize());
                                 if (execSize != 1)
@@ -999,9 +1009,11 @@ void CISA_IR_Builder::LinkTimeOptimization(
                 stackPointers[calleeBuilder->getFE_SP()] = stackPointers[callerBuilder->getFE_SP()];
                 stackPointers[calleeBuilder->getFE_FP()] = stackPointers[callerBuilder->getFE_FP()];
 
-                for (auto calleeIt = calleeInsts.begin(); calleeIt != calleeInsts.end(); calleeIt++)
+                for (auto calleeIt = calleeInsts.begin(); calleeIt != calleeInsts.end();)
                 {
+                    auto thisIt = calleeIt;
                     G4_INST *inst = *calleeIt;
+                    calleeIt++;
                     for (int i = 0, numSrc = inst->getNumSrc(); i < numSrc; ++i)
                     {
                         G4_Declare* rootDcl = getRootDeclare(inst->getSrc(i));
@@ -1010,19 +1022,34 @@ void CISA_IR_Builder::LinkTimeOptimization(
                         if (rootDcl == calleeBuilder->getFE_SP())
                         {
                             stackPointers[dst->getTopDcl()] = getPointerOffset(inst, stackPointers[rootDcl]);
-                            defInst[dst->getTopDcl()] = calleeIt;
+                            defInst[dst->getTopDcl()] = thisIt;
                             DEBUG_PRINT("(" << stackPointers[dst->getTopDcl()] << ") ");
                             DEBUG_UTIL(inst->dump());
                         }
                         else if (stackPointers.find(rootDcl) != stackPointers.end())
                         {
                             long long offset = stackPointers[rootDcl];
-                            if (inst->opcode() == G4_mov)
+                            auto execSize = static_cast<int>(inst->getExecSize());
+                            if (inst->opcode() == G4_add &&
+                                dst->getTopDcl()->getElemSize() == 4)
                             {
-                                auto execSize = static_cast<int>(inst->getExecSize());
                                 assert(execSize == 1);
+                                defInst[dst->getTopDcl()] = thisIt;
+                                DEBUG_PRINT("(" << stackPointers[dst->getTopDcl()] << ") 64-bit emulated Hi32 ");
+                                DEBUG_UTIL(inst->dump());
+                            }
+                            else if (inst->opcode() == G4_mov ||
+                                inst->opcode() == G4_add ||
+                                inst->opcode() == G4_addc)
+                            {
+                                if (execSize > 2)
+                                {
+                                    DEBUG_PRINT("Giving up tracking: ");
+                                    DEBUG_UTIL(inst->dump());
+                                    continue;
+                                }
                                 stackPointers[dst->getTopDcl()] = getPointerOffset(inst, offset);
-                                defInst[dst->getTopDcl()] = calleeIt;
+                                defInst[dst->getTopDcl()] = thisIt;
                                 DEBUG_PRINT("(" << stackPointers[dst->getTopDcl()] << ") ");
                                 DEBUG_UTIL(inst->dump());
                             }
@@ -1037,9 +1064,17 @@ void CISA_IR_Builder::LinkTimeOptimization(
                                     {
                                         DEBUG_PRINT("remove prevFP on callee's frame:\n");
                                         DEBUG_UTIL(inst->dump());
-                                        calleeInsts.erase(calleeIt);
+                                        calleeInsts.erase(thisIt);
                                         removeDeadCode(inst->getSrc(0), calleeInsts, calleeBuilder->getFE_FP());
-                                        removeDeadCode(inst->getSrc(1), calleeInsts, calleeBuilder->getFE_FP());
+                                        // Cannot remove inst->getSrc(1) in some cases
+                                        // old %fp can be used upon return to restore FP
+                                        // e.g.
+                                        // mov (M1_NM, 2) FP_1(0,0)<1> %fp(0,0)<1;1,0>   <- cannot remove
+                                        // mov (M1_NM, 2) FP_2(0,0)<1> %fp(0,0)<1;1,0>   <- dead code removed by inst->getSrc(0)
+                                        // svm_block_st (1) FP_2(0,0)<0;1,0> FP_1.0      <- removed prevFP
+                                        // ...
+                                        // mov (M1_NM, 2) %fp(0,0)<1> FP_1(0,0)<1;1,0>
+                                        // fret
                                         if (removeStackFrame)
                                         {
                                             DEBUG_PRINT("removed:");
@@ -1084,7 +1119,7 @@ void CISA_IR_Builder::LinkTimeOptimization(
                             }
                             else
                             {
-                                //assert(0 && "not implemented");
+                                assert(0 && "not implemented");
                             }
                         }
                     }
@@ -1212,6 +1247,10 @@ void CISA_IR_Builder::LinkTimeOptimization(
                     if (inst->opcode() == G4_goto)
                     {
                         inst->asCFInst()->setUip(labelMap[fret->asCFInst()->getUip()]);
+                    }
+                    else if ((inst->opcode() == G4_jmpi || inst->isCall()) && inst->getSrc(0) && inst->getSrc(0)->isLabel())
+                    {
+                        inst->setSrc(labelMap[fret->getSrc(0)->asLabel()], 0);
                     }
                     cloneDcl(inst->getDst());
                     cloneDcl(inst->getPredicate());
@@ -3579,6 +3618,7 @@ bool CISA_IR_Builder::createSample4Instruction(
     VISA_RESULT_CALL_TO_BOOL(status);
     return true;
 }
+
 
 
 bool CISA_IR_Builder::create3DLoadInstruction(

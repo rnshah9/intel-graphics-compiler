@@ -56,7 +56,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvm/Support/TargetRegistry.h"
+#include "llvmWrapper/Support/TargetRegistry.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
@@ -150,6 +150,8 @@ void initializeGenXPasses(PassRegistry &registry) {
   initializeGenXTrampolineInsertionPass(registry);
   initializeGenXPredRegionLoweringPass(registry);
   initializeGenXLinkageCorruptorPass(registry);
+  initializeGenXInlineAsmLoweringPass(registry);
+  initializeGenXDebugLegalizationPass(registry);
 
   // WRITE HERE MORE PASSES IF IT'S NEEDED;
 }
@@ -312,6 +314,7 @@ bool GenXTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   vc::addPass(PM, createInstructionCombiningPass());
 
   vc::addPass(PM, createGlobalDCEPass());
+  vc::addPass(PM, createGenXDebugLegalizationPass());
   vc::addPass(PM, createGenXLowerAggrCopiesPass());
   vc::addPass(PM, createInferAddressSpacesPass());
   /// .. include:: GenXStructSplitter.cpp

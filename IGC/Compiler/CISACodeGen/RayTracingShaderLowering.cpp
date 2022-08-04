@@ -20,6 +20,7 @@ SPDX-License-Identifier: MIT
 #include "RayTracingShaderLowering.hpp"
 #include "AdaptorCommon/RayTracing/RTBuilder.h"
 #include "IGCPassSupport.h"
+#include "Compiler/CISACodeGen/EmitVISAPass.hpp"
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
@@ -125,6 +126,9 @@ void RayTracingShaderLowering::simplifyCast(CastInst& CI)
             }
             else if (auto* NewCast = commonCastTransforms(*UserCI))
             {
+                const DebugLoc& DL = UserCI->getDebugLoc();
+                if (Instruction* NewCastInst = dyn_cast<Instruction>(NewCast))
+                    NewCastInst->setDebugLoc(DL);
                 NewCast->insertAfter(UserCI);
                 UserCI->replaceAllUsesWith(NewCast);
             }
@@ -167,6 +171,24 @@ bool RayTracingShaderLowering::runOnModule(Module& M)
         for (auto II = inst_begin(&F), IE = inst_end(&F); II != IE; /* empty */)
         {
             Instruction& I = *II++;
+            if (auto* II = dyn_cast<IntrinsicInst>(&I))
+            {
+                switch (II->getIntrinsicID())
+                {
+                case Intrinsic::lifetime_start:
+                case Intrinsic::lifetime_end:
+                {
+                    auto* Ptr = II->getOperand(1);
+                    uint32_t Addrspace =
+                        Ptr->getType()->getPointerAddressSpace();
+                    if (Addrspace != ADDRESS_SPACE_PRIVATE)
+                        II->eraseFromParent();
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
             auto* GII = dyn_cast<GenIntrinsicInst>(&I);
             if (!GII)
                 continue;

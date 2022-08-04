@@ -115,7 +115,7 @@ namespace
         }
         unsigned int getAlignment() const
         {
-            return isa<LoadInst>(m_inst) ? getLoad()->getAlignment() : getLdRaw()->getAlignment();
+            return (unsigned)(isa<LoadInst>(m_inst) ? getLoad()->getAlignment() : getLdRaw()->getAlignment());
         }
         void setAlignment(unsigned int alignment)
         {
@@ -220,7 +220,7 @@ namespace
         }
         unsigned int getAlignment() const
         {
-            return isa<StoreInst>(m_inst) ? getStore()->getAlignment() : getStoreRaw()->getAlignment();
+            return (unsigned)(isa<StoreInst>(m_inst) ? getStore()->getAlignment() : getStoreRaw()->getAlignment());
         }
         void setAlignment(unsigned int alignment)
         {
@@ -1393,7 +1393,7 @@ Instruction* VectorPreProcess::simplifyLoadStore(Instruction* Inst)
         }
 
         // All uses are constant EEI.
-        IGC_ASSERT_MESSAGE(ConstEEIUses.size() == (BC ? BC : Inst)->getNumUses(), "out of sync");
+        IGC_ASSERT_MESSAGE((BC ? BC : Inst)->hasNUses(ConstEEIUses.size()), "out of sync");
 
         // FIXME: this is to WA an issue that splitLoadStore does not split
         // vectors of size 5, 6, 7.

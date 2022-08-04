@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021 Intel Corporation
+Copyright (C) 2021-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -51,6 +51,8 @@ inline const char *getPlatformStr(PLATFORM Platform, unsigned &RevId) {
       return "ADLS";
     if (Product == IGFX_ALDERLAKE_P)
       return "ADLP";
+    if (Product == IGFX_ALDERLAKE_N)
+      return "ADLN";
     else if (Product == IGFX_XE_HP_SDV)
       return "XEHP";
     else if (Product == IGFX_DG2)

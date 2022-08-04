@@ -103,6 +103,7 @@ namespace
         void replaceMemMove(IntrinsicInst* I);
         void replaceExpect(IntrinsicInst* I);
         void replaceFunnelShift(IntrinsicInst* I);
+        void replaceLRound(IntrinsicInst* I);
 
         static const std::map< Intrinsic::ID, MemFuncPtr_t > m_intrinsicToFunc;
     };
@@ -126,7 +127,9 @@ const std::map< Intrinsic::ID, ReplaceUnsupportedIntrinsics::MemFuncPtr_t > Repl
     { Intrinsic::memcpy,     &ReplaceUnsupportedIntrinsics::replaceMemcpy },
     { Intrinsic::memset,     &ReplaceUnsupportedIntrinsics::replaceMemset },
     { Intrinsic::memmove,    &ReplaceUnsupportedIntrinsics::replaceMemMove },
-    { Intrinsic::expect,     &ReplaceUnsupportedIntrinsics::replaceExpect }
+    { Intrinsic::expect,     &ReplaceUnsupportedIntrinsics::replaceExpect },
+    { Intrinsic::lround,     &ReplaceUnsupportedIntrinsics::replaceLRound },
+    { Intrinsic::llround,    &ReplaceUnsupportedIntrinsics::replaceLRound }
 };
 
 ReplaceUnsupportedIntrinsics::ReplaceUnsupportedIntrinsics() : FunctionPass(ID)
@@ -137,7 +140,7 @@ ReplaceUnsupportedIntrinsics::ReplaceUnsupportedIntrinsics() : FunctionPass(ID)
 MemCpyInst* ReplaceUnsupportedIntrinsics::MemMoveToMemCpy(MemMoveInst* MM)
 {
     SmallVector<Value*, 5> args;
-    for (unsigned i = 0; i < MM->getNumArgOperands(); i++)
+    for (unsigned i = 0; i < IGCLLVM::getNumArgOperands(MM); i++)
         args.push_back(MM->getArgOperand(i));
 
     auto* Dst = MM->getRawDest();
@@ -889,7 +892,7 @@ void ReplaceUnsupportedIntrinsics::replaceExpect(IntrinsicInst* MS)
   Replaces llvm.fshl.* and llvm.fshr.* funnel shift intrinsics.
   E.g. for fshl we would produce a following sequence:
   %r = call i8 @llvm.fshl.i8(i8 %a, i8 %b, i8 %c) =>
-  %modRes = urem i8 %c, 8        // get the modulo of shift value
+  %modRes = and i8 %c, 7         // (urem i8 %c, 8 ) get the modulo of shift value
   %subRes = sub i8 8, %modRes    // subtract from the type's number of bits
   %shlRes = shl i8 %a, %modRes   // shift the bits according to instruction spec
   %shrRes = lshr i8 %b, %subRes
@@ -913,11 +916,14 @@ void ReplaceUnsupportedIntrinsics::replaceFunnelShift(IntrinsicInst* I) {
         }
     }
 
+    IGC_ASSERT(isPowerOf2_32(sizeInBits));
     Value* numBits = Builder.getIntN(sizeInBits, sizeInBits);
+    Value* mask = Builder.getIntN(sizeInBits, sizeInBits - 1);
     if (auto IVT = dyn_cast<IGCLLVM::FixedVectorType>(I->getType())) {
         numBits = ConstantVector::getSplat(IGCLLVM::getElementCount((uint32_t)IVT->getNumElements()), cast<Constant>(numBits));
+        mask = ConstantVector::getSplat(IGCLLVM::getElementCount((uint32_t)IVT->getNumElements()), cast<Constant>(mask));
     }
-    auto shiftModulo = Builder.CreateURem(I->getArgOperand(2), numBits);
+    auto shiftModulo = Builder.CreateAnd(I->getArgOperand(2), mask);
     auto negativeShift = Builder.CreateSub(numBits, shiftModulo);
     if (I->getIntrinsicID() == Intrinsic::fshr) {
         std::swap(shiftModulo, negativeShift);
@@ -927,6 +933,55 @@ void ReplaceUnsupportedIntrinsics::replaceFunnelShift(IntrinsicInst* I) {
     auto result = Builder.CreateOr(upperShifted, lowerShifted);
 
     I->replaceAllUsesWith(result);
+    I->eraseFromParent();
+}
+
+/*
+  Replaces llvm.lround.* and llvm.llround.* intrinsics.
+  The llvm.lround.* intrinsics return the operand rounded to
+  the nearest integer with ties away from zero.
+  @llvm.lround.i32.f32(float f) => (i32)(f + (f >= 0.0 ? 0.5 : -0.5))
+  E.g. for lround we would produce a following sequence:
+  %r = call i32 @llvm.lround.i32.f32(float f)
+  =>
+  %cmp = fcmp oge float %f, 0.000000e+00
+  %cond = select i1 %cmp, double 5.000000e-01, double -5.000000e-01
+  %df = fpext float %f to double
+  %add = fadd double %df, %cond
+  %conv = fptosi double %add to i32
+*/
+void ReplaceUnsupportedIntrinsics::replaceLRound(IntrinsicInst* I) {
+    IGC_ASSERT(I->getIntrinsicID() == Intrinsic::lround ||
+        I->getIntrinsicID() == Intrinsic::llround);
+    Value* inVal = I->getArgOperand(0);
+    Type* dstType = I->getType();
+    Type* srcType = inVal->getType();
+    IGC_ASSERT(!(srcType->isVectorTy() || dstType->isVectorTy()));
+    IGC_ASSERT(srcType->isFloatTy() || srcType->isDoubleTy());
+    IGC_ASSERT(dstType->isIntegerTy());
+    IGCLLVM::IRBuilder<> Builder(I);
+    Value* zero = ConstantFP::get(srcType, 0.0f);
+    Value* cmp = Builder.CreateFCmpOGE(inVal, zero);
+    Value* val05 = nullptr;
+    Value* valm05 = nullptr;
+    if (srcType->isFloatTy() && m_Ctx->platform.hasNoFP64Inst())
+    {
+        val05 = ConstantFP::get(Builder.getFloatTy(), 0.5f);
+        valm05 = ConstantFP::get(Builder.getFloatTy(), -0.5f);
+    }
+    else
+    {
+        val05 = ConstantFP::get(Builder.getDoubleTy(), 0.5);
+        valm05 = ConstantFP::get(Builder.getDoubleTy(), -0.5);
+    }
+    Value* cond = Builder.CreateSelect(cmp, val05, valm05);
+    if (srcType->isFloatTy() && !(m_Ctx->platform.hasNoFP64Inst()))
+    {
+        inVal = Builder.CreateFPExt(inVal, Builder.getDoubleTy());
+    }
+    Value* add = Builder.CreateFAdd(inVal, cond);
+    Value* conv = Builder.CreateFPToSI(add, dstType);
+    I->replaceAllUsesWith(conv);
     I->eraseFromParent();
 }
 

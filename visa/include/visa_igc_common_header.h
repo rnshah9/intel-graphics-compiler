@@ -17,6 +17,13 @@ typedef enum
     vISA_ASM_READER     // mode for visa text input
 } vISABuilderMode;
 
+// Target should be specified as follows
+// - Kernel target attribute in VISA binarary or visaasm
+typedef enum {
+    VISA_CM = 0,
+    VISA_3D = 1
+} VISATarget;
+
 typedef enum
 {
     PREDEFINED_NULL             = 0,
@@ -39,6 +46,7 @@ typedef enum
     PREDEFINED_COLOR            = 17,
     PREDEFINED_IMPL_ARG_BUF_PTR = 18,
     PREDEFINED_LOCAL_ID_BUF_PTR = 19,
+    PREDEFINED_MSG0             = 20,
     PREDEFINED_VAR_INVALID
 } PreDefined_Vars;
 
@@ -477,6 +485,7 @@ typedef enum {
     GENX_TGLLP,
     Xe_XeHPSDV,
     Xe_DG2,
+    Xe_MTL,
     Xe_PVC,
     Xe_PVCXT,
     ALL

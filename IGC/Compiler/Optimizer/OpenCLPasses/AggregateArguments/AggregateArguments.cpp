@@ -90,6 +90,23 @@ bool AggregateArgumentsAnalysis::runOnModule(Module& M)
         {
             Argument* arg = &(*argument);
 
+            // According to level-zero documentation https://spec.oneapi.io/level-zero/latest/core/SPIRV.html#kernel-arguments
+            // Array type is not allowed as a kernel argument
+            if (arg->getType()->isArrayTy())
+            {
+                getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitError("Array type is not allowed as a kernel argument", arg);
+            }
+            // Handling case where array is passed as a pointer with byVal attribute
+            else if (arg->getType()->isPointerTy() && arg->hasByValAttr())
+            {
+                Type* type = arg->getType()->getPointerElementType();
+
+                if (ArrayType* arrayType = dyn_cast<ArrayType>(type))
+                {
+                    getAnalysis<CodeGenContextWrapper>().getCodeGenContext()->EmitError("Array type is not allowed as a kernel argument", arg);
+                }
+            }
+
             if (!isSupportedAggregateArgument(arg))
             {
                 continue;

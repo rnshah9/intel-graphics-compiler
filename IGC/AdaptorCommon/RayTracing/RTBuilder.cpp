@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2019-2021 Intel Corporation
+Copyright (C) 2019-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -23,6 +23,7 @@ SPDX-License-Identifier: MIT
 #include "RTStackFormat.h"
 #include "Probe/Assertion.h"
 
+#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include "common/LLVMWarningsPush.hpp"
@@ -198,6 +199,15 @@ Value* RTBuilder::getpMissShaderBasePtr(void)
     auto* BasePtr = this->getGlobalBufferPtr();
     auto* Ptr = this->_gepof_pMissShaderBasePtr(BasePtr, VALUE_NAME("&pMissShaderBasePtr"));
     LoadInst* Val = this->CreateLoad(Ptr, VALUE_NAME("pMissShaderBasePtr"));
+    setInvariantLoad(Val);
+    return Val;
+}
+
+Value* RTBuilder::getStatelessScratchPtr(void)
+{
+    auto* BasePtr = this->getGlobalBufferPtr();
+    auto* Ptr = this->_gepof_statelessScratchPtr(BasePtr, VALUE_NAME("&statelessScratchPtr"));
+    LoadInst* Val = this->CreateLoad(Ptr, VALUE_NAME("statelessScratchPtr"));
     setInvariantLoad(Val);
     return Val;
 }
@@ -1678,7 +1688,21 @@ PHINode* RTBuilder::getPrimitiveIndex(
     this->SetInsertPoint(CSBlock);
 
     Value* primLeafIndexTop = this->getHitInfoDWord(perLaneStackPtr, ShaderTy, VALUE_NAME("topOfPrimIndexDelta"));
-    Value* leafTyCmp = this->CreateICmpEQ(infoKind, this->getInt32(NODE_TYPE_PROCEDURAL));
+
+    // We are interested in only the LSB of leafType
+    // because we only check if type is procedural.
+
+    static_assert(
+        ((NODE_TYPE_PROCEDURAL & 1) == 1) &&
+        ((NODE_TYPE_QUAD & 1) == 0) &&
+        ((NODE_TYPE_MESHLET & 1) == 0),
+        "optimized CommittedStatus broken");
+
+    // At this point valid bit is expected to be right-shifted to the
+    // 0th bit.
+    Value* leafType = this->CreateAnd(infoKind, this->getInt32(1));
+    Value* leafTyCmp = this->CreateICmpEQ(leafType, this->getInt32(NODE_TYPE_PROCEDURAL & 1));
+
     this->CreateCondBr(leafTyCmp, prodeduralLeafBB, quadMeshLeafBB);
     auto& M = *this->GetInsertBlock()->getModule();
 
@@ -1773,7 +1797,21 @@ std::pair<Value*, BasicBlock*> RTBuilder::getGeometryIndex(
     BasicBlock* prodeduralLeafBB = BasicBlock::Create(C, VALUE_NAME("ProduralLeafBB"), F, endBlock);
     CSBlock->getTerminator()->eraseFromParent();
     this->SetInsertPoint(CSBlock);
-    Value* leafTyCmp = this->CreateICmpEQ(infoKind, this->getInt32(NODE_TYPE_PROCEDURAL));
+
+    // We are interested in only the LSB of leafType
+    // because we only check if type is procedural.
+
+    static_assert(
+        ((NODE_TYPE_PROCEDURAL & 1) == 1) &&
+        ((NODE_TYPE_QUAD & 1) == 0) &&
+        ((NODE_TYPE_MESHLET & 1) == 0),
+        "optimized CommittedStatus broken");
+
+    // At this point valid bit is expected to be right-shifted to the
+    // 0th bit.
+    Value* leafType = this->CreateAnd(infoKind, this->getInt32(1));
+    Value* leafTyCmp = this->CreateICmpEQ(leafType, this->getInt32(NODE_TYPE_PROCEDURAL & 1));
+
     this->CreateCondBr(leafTyCmp, prodeduralLeafBB, quadMeshLeafBB);
     auto& M = *this->GetInsertBlock()->getModule();
 
@@ -2476,6 +2514,40 @@ void RTBuilder::setDispatchRayIndices(
     this->CreateStore(CompressedVal, CompressedPtr);
 }
 
+Value* RTBuilder::computeReturnIP(
+    const IGC::RayDispatchShaderContext& RayCtx,
+    Function& F)
+{
+    IGC_ASSERT(RayCtx.requiresIndirectContinuationHandling());
+
+    auto* modMD = RayCtx.getModuleMetaData();
+    auto& FuncMD = modMD->FuncMD;
+    auto I = FuncMD.find(&F);
+
+    std::optional<uint32_t> SlotNum;
+    if (I != FuncMD.end())
+        SlotNum = I->second.rtInfo.SlotNum;
+
+    Value* ShaderRecordPtr = nullptr;
+
+    if (SlotNum)
+    {
+        // Compute the KSP pointer by subtracting back from the local
+        // pointer
+        IGC_ASSERT(ShaderIdentifier::NumSlots > *SlotNum);
+        auto* LP = this->getLocalBufferPtr(None);
+        const int32_t Offset =
+            (ShaderIdentifier::NumSlots - *SlotNum) * sizeof(KSP);
+        ShaderRecordPtr = this->CreateGEP(LP, this->getInt32(-Offset));
+    }
+    else
+    {
+        ShaderRecordPtr = this->getShaderRecordPtr(&F);
+    }
+    Value* contId = this->CreatePtrToInt(ShaderRecordPtr, this->getInt64Ty());
+    return contId;
+}
+
 void RTBuilder::storeContinuationAddress(
     TraceRayRTArgs &Args,
     Type *PayloadTy,
@@ -2491,47 +2563,9 @@ void RTBuilder::storeContinuationAddress(
     auto& RayCtx = static_cast<const RayDispatchShaderContext&>(this->Ctx);
 
     if (RayCtx.requiresIndirectContinuationHandling())
-    {
-        auto* modMD = RayCtx.getModuleMetaData();
-        auto& FuncMD = modMD->FuncMD;
-        auto I = FuncMD.find(intrin->getContinuationFn());
-
-        std::optional<uint32_t> SlotNum;
-        if (I != FuncMD.end())
-            SlotNum = I->second.rtInfo.SlotNum;
-
-        Value* ShaderRecordPtr = nullptr;
-
-        if (SlotNum)
-        {
-            // Compute the KSP pointer by subtracting back from the local
-            // pointer
-            IGC_ASSERT(ShaderIdentifier::NumSlots > *SlotNum);
-            auto* LP = this->getLocalBufferPtr(None);
-            const int32_t Offset =
-                (ShaderIdentifier::NumSlots - *SlotNum) * sizeof(KSP);
-            ShaderRecordPtr = this->CreateGEP(LP, this->getInt32(-Offset));
-        }
-        else
-        {
-            Function* pFunc = GenISAIntrinsic::getDeclaration(
-                this->GetInsertBlock()->getModule(),
-                GenISAIntrinsic::GenISA_GetShaderRecordPtr);
-            auto* Cast = this->CreatePointerBitCastOrAddrSpaceCast(
-                intrin->getContinuationFn(),
-                this->getInt8PtrTy());
-            ShaderRecordPtr = this->CreateCall(
-                pFunc,
-                Cast,
-                VALUE_NAME("&ShaderRecord"));
-        }
-        contId = this->CreatePtrToInt(
-            ShaderRecordPtr, this->getInt64Ty());
-    }
+        contId = computeReturnIP(RayCtx, *intrin->getContinuationFn());
     else
-    {
         contId = this->getInt64(intrin->getContinuationID());
-    }
 
     Value* Ptr = Args.getReturnIPPtr(
         *this, PayloadTy, StackFrameVal, VALUE_NAME("&NextFrame"));
@@ -2539,15 +2573,17 @@ void RTBuilder::storeContinuationAddress(
     this->CreateStore(contId, Ptr);
 }
 
-void RTBuilder::storePayload(
+SmallVector<StoreInst*, 2> RTBuilder::storePayload(
     TraceRayRTArgs &Args,
     Value* Payload,
     RTBuilder::SWStackPtrVal* StackFrameVal)
 {
+    SmallVector<StoreInst*, 2> Stores;
     auto* Ptr = Args.getPayloadPtr(
         *this, Payload->getType(), StackFrameVal, VALUE_NAME("&NextFrame"));
 
-    this->CreateStore(Payload, Ptr);
+    auto *First = this->CreateStore(Payload, Ptr);
+    Stores.push_back(First);
 
     if (Args.needPayloadPadding())
     {
@@ -2556,8 +2592,10 @@ void RTBuilder::storePayload(
 
         // This is padded out to ensure we don't have a partial write. We just
         // write '0' here by convention but it shouldn't be read anywhere.
-        this->CreateStore(this->getInt32(0), PadPtr);
+        auto *Second = this->CreateStore(this->getInt32(0), PadPtr);
+        Stores.push_back(Second);
     }
+    return Stores;
 }
 
 // This function loads the ray payload from the RTStack that was previously stored
@@ -3043,7 +3081,7 @@ Value* RTBuilder::getSyncTraceRayControl(Value* ptrCtrl)
 
 void RTBuilder::setSyncTraceRayControl(Value* ptrCtrl, unsigned ctrl)
 {
-    Type* eleType = cast<PointerType>(ptrCtrl->getType())->getElementType();
+    Type* eleType = cast<PointerType>(ptrCtrl->getType())->getPointerElementType();
     this->CreateStore(llvm::ConstantInt::get(eleType, ctrl), ptrCtrl);
 }
 
@@ -3251,30 +3289,30 @@ Value* RTBuilder::createAllocaNumber(const AllocaInst* AI, uint32_t Number)
 void RTBuilder::setReturnAlignment(CallInst* CI, uint32_t AlignVal)
 {
     auto Attrs = CI->getAttributes();
-    AttrBuilder AB{ Attrs, AttributeList::ReturnIndex };
+    IGCLLVM::AttrBuilder AB { CI->getContext(), Attrs.getAttributes(AttributeList::ReturnIndex)};
     AB.addAlignmentAttr(AlignVal);
     auto AL =
-        Attrs.addAttributes(CI->getContext(), AttributeList::ReturnIndex, AB);
+        IGCLLVM::addAttributesAtIndex(Attrs, CI->getContext(), AttributeList::ReturnIndex, AB);
     CI->setAttributes(AL);
 }
 
 void RTBuilder::setNoAlias(CallInst* CI)
 {
     auto Attrs = CI->getAttributes();
-    AttrBuilder AB{ Attrs, AttributeList::ReturnIndex };
+    IGCLLVM::AttrBuilder AB{ CI->getContext(), Attrs.getAttributes(AttributeList::ReturnIndex) };
     AB.addAttribute(Attribute::AttrKind::NoAlias);
     auto AL =
-        Attrs.addAttributes(CI->getContext(), AttributeList::ReturnIndex, AB);
+        IGCLLVM::addAttributesAtIndex(Attrs, CI->getContext(), AttributeList::ReturnIndex, AB);
     CI->setAttributes(AL);
 }
 
 void RTBuilder::setDereferenceable(CallInst* CI, uint32_t Size)
 {
     auto Attrs = CI->getAttributes();
-    AttrBuilder AB{ Attrs, AttributeList::ReturnIndex };
+    IGCLLVM::AttrBuilder AB{ CI->getContext(), Attrs.getAttributes(AttributeList::ReturnIndex) };
     AB.addDereferenceableAttr(Size);
     auto AL =
-        Attrs.addAttributes(CI->getContext(), AttributeList::ReturnIndex, AB);
+        IGCLLVM::addAttributesAtIndex(Attrs, CI->getContext(), AttributeList::ReturnIndex, AB);
     CI->setAttributes(AL);
 }
 
@@ -3367,15 +3405,21 @@ CallInst* RTBuilder::getInlineData(Type* RetTy, uint32_t QwordOffset, uint32_t A
     return CI;
 }
 
-PayloadPtrIntrinsic* RTBuilder::getPayloadPtrIntrinsic(Value* PayloadPtr)
+PayloadPtrIntrinsic* RTBuilder::getPayloadPtrIntrinsic(
+    Value* PayloadPtr, SWStackPtrVal* FrameAddr)
 {
     Module* M = this->GetInsertBlock()->getModule();
-    auto *CI = this->CreateCall(
+    Type* Tys[] = {
+        PayloadPtr->getType(),
+        FrameAddr->getType()
+    };
+    auto *CI = this->CreateCall2(
         GenISAIntrinsic::getDeclaration(
             M,
             GenISAIntrinsic::GenISA_PayloadPtr,
-            PayloadPtr->getType()),
+            Tys),
         PayloadPtr,
+        FrameAddr,
         VALUE_NAME("&Payload"));
     return cast<PayloadPtrIntrinsic>(CI);
 }
@@ -3916,4 +3960,29 @@ Optional<uint32_t> RTBuilder::getSpillSize(const ContinuationHLIntrinsic& CI)
     auto* CMD = cast<ConstantAsMetadata>(MD->getOperand(0));
     auto* C = cast<ConstantInt>(CMD->getValue());
     return static_cast<uint32_t>(C->getZExtValue());
+}
+
+void RTBuilder::markAsContinuation(Function& F)
+{
+    F.addFnAttr(IsContinuation);
+}
+
+bool RTBuilder::isContinuation(const Function& F)
+{
+    return F.hasFnAttribute(IsContinuation);
+}
+
+GetShaderRecordPtrIntrinsic* RTBuilder::getShaderRecordPtr(Function* F)
+{
+    Function* pFunc = GenISAIntrinsic::getDeclaration(
+        this->GetInsertBlock()->getModule(),
+        GenISAIntrinsic::GenISA_GetShaderRecordPtr);
+    auto* Cast = this->CreatePointerBitCastOrAddrSpaceCast(
+        F,
+        this->getInt8PtrTy());
+    auto *CI = this->CreateCall(
+        pFunc,
+        Cast,
+        VALUE_NAME("&ShaderRecord"));
+    return cast<GetShaderRecordPtrIntrinsic>(CI);
 }

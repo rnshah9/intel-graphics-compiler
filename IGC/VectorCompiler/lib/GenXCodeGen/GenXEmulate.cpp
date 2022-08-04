@@ -14,8 +14,7 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "GENX_EMULATION"
-
+#include "llvmWrapper/IR/Instructions.h"
 #include "GenX.h"
 #include "GenXSubtarget.h"
 #include "GenXTargetMachine.h"
@@ -44,6 +43,8 @@ SPDX-License-Identifier: MIT
 #include <llvm/Pass.h>
 #include <llvm/Support/Process.h>
 #include <llvm/Support/raw_ostream.h>
+
+#define DEBUG_TYPE "GENX_EMULATION"
 
 #include "Probe/Assertion.h"
 
@@ -1220,7 +1221,7 @@ Value *GenXEmulate::Emu64Expander::visitGenxFPToISat(CallInst &CI) {
     vc::diagnose(CI.getContext(), "GenXEmulate",
                  "Unsupported instruction for emulation", &CI);
 
-  SmallVector<Value *, 8> Args(CI.arg_operands());
+  SmallVector<Value *, 8> Args(IGCLLVM::args(CI));
 
   return Builder.CreateCall(Iter->second, Args);
 }
@@ -1916,11 +1917,11 @@ public:
                                   .getTM<GenXTargetMachine>()
                                   .getGenXSubtarget();
     for (Function &F : M) {
+      DeriveRoundingAttributes(F);
       if (!IsLibraryFunction(F)) {
         continue;
       }
       F.addFnAttr(vc::FunctionMD::VCEmulationRoutine);
-      DeriveRoundingAttributes(F);
     }
 
     PurgeUnneededEmulationFunctions(M, ST);
@@ -2003,9 +2004,6 @@ private:
   }
 
   static void DeriveRoundingAttributes(Function &F) {
-
-    IGC_ASSERT(IsLibraryFunction(F));
-
     const auto &Name = F.getName();
     if (Name.contains(RoundingRtzSuffix)) {
       F.addFnAttr(genx::FunctionMD::CMFloatControl,

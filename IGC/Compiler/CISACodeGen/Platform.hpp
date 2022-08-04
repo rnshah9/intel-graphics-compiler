@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -106,6 +106,7 @@ bool needsHSBarrierIDWorkaround() const { return m_platformInfo.eRenderCoreFamil
 bool supportBindless() const { return m_platformInfo.eRenderCoreFamily >= IGFX_GEN9_CORE; }
 bool supportsBindlessSamplers() const { return m_platformInfo.eRenderCoreFamily >= IGFX_GEN10_CORE; }
 
+
 bool SupportSurfaceInfoMessage() const { return m_platformInfo.eRenderCoreFamily >= IGFX_GEN9_CORE; }
 bool SupportHDCUnormFormats() const { return m_platformInfo.eRenderCoreFamily >= IGFX_GEN10_CORE; }
     bool localMemFenceSupress() const {
@@ -136,37 +137,18 @@ bool support16BitImmSrcForMad() const {
     return (m_platformInfo.eRenderCoreFamily >= IGFX_GEN10_CORE);
 }
 
-//This function is for handling special cases,
-//where simple >= comparison between products/cores doesn't produce expected results.
+// This function checks if product is child of another product
 bool isProductChildOf(PRODUCT_FAMILY product) const
 {
-    bool result;
-    switch (product) {
-    case IGFX_PVC:
-        result = isCoreChildOf(IGFX_XE_HPC_CORE);
-        break;
-    case IGFX_XE_HP_SDV:
-        result = isCoreChildOf(IGFX_XE_HP_CORE);
-        break;
-    case IGFX_DG2:
-        result = isCoreChildOf(IGFX_XE_HPG_CORE);
-        break;
-    default:
-        result = m_platformInfo.eProductFamily >= product;
-        break;
-    }
-    return result;
+    if (product == IGFX_PVC)
+        return isCoreChildOf(IGFX_XE_HPC_CORE);
+    return m_platformInfo.eProductFamily >= product;
 }
 
+// This function checks if core is child of another core
 bool isCoreChildOf(GFXCORE_FAMILY core) const
 {
-    bool result;
-    switch (core) {
-    default:
-        result = m_platformInfo.eRenderCoreFamily >= core;
-        break;
-    }
-    return result;
+    return m_platformInfo.eRenderCoreFamily >= core;
 }
 
 bool supports8DWLSCMessage() const {
@@ -439,6 +421,7 @@ bool hasSamplerSupport() const
         (IGC_IS_FLAG_ENABLED(EnableSamplerSupport)); // flag for IGFX_PVC
 }
 
+bool hasLogicalSSID() const { return false; }
 uint32_t getMinPushConstantBufferAlignment() const
 {
     return 8; // DWORDs
@@ -728,7 +711,7 @@ bool hasNoFullI64Support() const
 bool WaPredicatedStackIDRelease() const
 {
     return m_WaTable.Wa_22014559856 &&
-           IGC_IS_FLAG_ENABLED(EnablePredicatedStackIDRelease);
+           IGC_IS_FLAG_DISABLED(DisablePredicatedStackIDRelease);
 }
 
 // This returns the current maximum size that we recommend for performance.
@@ -1086,6 +1069,7 @@ bool hasNoInt64Inst() const {
         m_platformInfo.eProductFamily == IGFX_ROCKETLAKE ||
         m_platformInfo.eProductFamily == IGFX_ALDERLAKE_S ||
         m_platformInfo.eProductFamily == IGFX_ALDERLAKE_P ||
+        m_platformInfo.eProductFamily == IGFX_ALDERLAKE_N ||
         m_platformInfo.eProductFamily == IGFX_DG1 ||
         m_platformInfo.eProductFamily == IGFX_DG2;
 }
@@ -1100,6 +1084,7 @@ bool hasNoFP64Inst() const {
         m_platformInfo.eProductFamily == IGFX_ROCKETLAKE ||
         m_platformInfo.eProductFamily == IGFX_ALDERLAKE_S ||
         m_platformInfo.eProductFamily == IGFX_ALDERLAKE_P ||
+        m_platformInfo.eProductFamily == IGFX_ALDERLAKE_N ||
         m_platformInfo.eProductFamily == IGFX_DG1 ||
         m_platformInfo.eProductFamily == IGFX_DG2;
 }
@@ -1114,6 +1099,7 @@ bool hasCorrectlyRoundedMacros() const {
         m_platformInfo.eProductFamily != IGFX_DG1 &&
         m_platformInfo.eProductFamily != IGFX_ALDERLAKE_S &&
         m_platformInfo.eProductFamily != IGFX_ALDERLAKE_P &&
+        m_platformInfo.eProductFamily != IGFX_ALDERLAKE_N &&
         m_platformInfo.eProductFamily != IGFX_DG2;
 }
 
@@ -1346,6 +1332,13 @@ unsigned forceQwAtSrc0ForQwShlWA() const
 bool hasSIMD8Support() const
 {
     return !(m_platformInfo.eRenderCoreFamily == IGFX_XE_HPC_CORE);
+}
+
+bool hasThreadPauseSupport() const
+{
+    if (isCoreChildOf(IGFX_XE_HPC_CORE))
+        return false;
+    return true;
 }
 };
 }//namespace IGC

@@ -70,6 +70,11 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
         // const unsigned AS = ptrType->getAddressSpace();
         const unsigned AS = ptrType->getAddressSpace() != ADDRESS_SPACE_PRIVATE ? ptrType->getAddressSpace() : ADDRESS_SPACE_CONSTANT;
 
+        if (ptrType->getAddressSpace() == ADDRESS_SPACE_PRIVATE)
+        {
+            Ctx->m_hasGlobalInPrivateAddressSpace = true;
+        }
+
         // local address space variables are also generated as GlobalVariables.
         // Ignore them here.
         if (AS == ADDRESS_SPACE_LOCAL)
@@ -258,7 +263,7 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
         {
             if (pFunc.isDeclaration()) continue;
             // Skip functions called from function marked with stackcall attribute
-            if (AddImplicitArgs::hasStackCallInCG(&pFunc)) continue;
+            if (AddImplicitArgs::hasStackCallInCG(&pFunc, *Ctx)) continue;
 
             // Always add for kernels and subroutines
             SmallVector<ImplicitArg::ArgType, 1> implicitArgs;
@@ -273,7 +278,7 @@ bool ProgramScopeConstantAnalysis::runOnModule(Module& M)
         {
             if (pFunc.isDeclaration()) continue;
             // Skip functions called from function marked with stackcall attribute
-            if (AddImplicitArgs::hasStackCallInCG(&pFunc)) continue;
+            if (AddImplicitArgs::hasStackCallInCG(&pFunc, *Ctx)) continue;
 
             // Always add for kernels and subroutines
             SmallVector<ImplicitArg::ArgType, 1> implicitArgs;
@@ -399,7 +404,7 @@ void ProgramScopeConstantAnalysis::addData(Constant* initializer,
     unsigned addressSpace)
 {
     // Initial alignment padding before insert the current constant into the buffer.
-    alignBuffer(inlineProgramScopeBuffer, m_DL->getABITypeAlignment(initializer->getType()));
+    alignBuffer(inlineProgramScopeBuffer, (unsigned)m_DL->getABITypeAlignment(initializer->getType()));
 
     // We need to do extra work with pointers here: we don't know their actual addresses
     // at compile time so we find the offset from the base of the buffer they point to
@@ -467,7 +472,7 @@ void ProgramScopeConstantAnalysis::addData(Constant* initializer,
         {
             inlineProgramScopeBuffer.insert(inlineProgramScopeBuffer.end(), pointerSize, 0);
         }
-        else if (isa<FunctionType>(ptrType->getElementType()))
+        else if (isa<FunctionType>(ptrType->getPointerElementType()))
         {
             // Save patch info for function pointer to be patched later by runtime
             // The initializer value must be a function pointer and has the "referenced-indirectly" attribute
@@ -616,5 +621,5 @@ void ProgramScopeConstantAnalysis::addData(Constant* initializer,
 
     // final padding.  This gets used by the vec3 types that will insert zero padding at the
     // end after inserting the actual vector contents (this is due to sizeof(vec3) == 4 * sizeof(scalarType)).
-    alignBuffer(inlineProgramScopeBuffer, m_DL->getABITypeAlignment(initializer->getType()));
+    alignBuffer(inlineProgramScopeBuffer, (unsigned)m_DL->getABITypeAlignment(initializer->getType()));
 }

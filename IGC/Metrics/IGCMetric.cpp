@@ -86,6 +86,11 @@ namespace IGCMetrics
         get(igcMetric)->CollectLoops(loopInfo);
     }
 
+    void IGCMetric::UpdateVariable(llvm::Value* Org, llvm::Value* New)
+    {
+        get(igcMetric)->UpdateVariable(Org, New);
+    }
+
     void IGCMetric::CollectMem2Reg(llvm::AllocaInst* pAllocaInst, IGC::StatusPrivArr2Reg status)
     {
         get(igcMetric)->CollectMem2Reg(pAllocaInst, status);
@@ -189,9 +194,9 @@ namespace IGCMetrics
         get(igcMetric)->FinalizeStats();
     }
 
-    void IGCMetric::CollectDataFromDebugInfo(IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pVisaDbgInfo)
+    void IGCMetric::CollectDataFromDebugInfo(llvm::Function* pFunc, IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pVisaDbgInfo)
     {
-        get(igcMetric)->CollectDataFromDebugInfo(pDebugInfo, pVisaDbgInfo);
+        get(igcMetric)->CollectDataFromDebugInfo(pFunc, pDebugInfo, pVisaDbgInfo);
     }
 
     bool IGCMetric::isMetricFuncCall(llvm::CallInst* pCall)

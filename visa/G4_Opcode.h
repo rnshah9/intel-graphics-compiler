@@ -11,7 +11,7 @@ SPDX-License-Identifier: MIT
 #include "visa_igc_common_header.h"
 #include "common.h"
 
-#define G4_MAX_SRCS       4
+#define G4_MAX_SRCS      5
 #define G4_MAX_INTRINSIC_SRCS       8
 #define UNDEFINED_VAL   0xFFFFFFFF
 #define UNDEFINED_SHORT 0x8000
@@ -309,7 +309,7 @@ enum G4_InstOption
     InstOpt_Compacted   = 0x00002000,
     InstOpt_NoSrcDepSet = 0x00004000,
     InstOpt_NoPreempt   = 0x00008000,
-    InstOpt_Serialize   = 0x0001000,
+    InstOpt_Serialize   = 0x00010000,
 
     InstOpt_END         = 0xFFFFFFFF
 };
@@ -423,7 +423,7 @@ enum G4_ArchRegKind {
     AREG_ACC0,        // accumulator register
     AREG_ACC1,        // accumulator register
     AREG_MASK0,       // mask register
-    AREG_MS0,         // mask stack register
+    AREG_MSG0,        // message control register
     AREG_DBG,         // mask stack depth register
     AREG_SR0,         // state register
     AREG_CR0,         // control register

@@ -55,6 +55,7 @@ namespace IGCMetrics
 
         void CollectRegStats(KERNEL_INFO* vISAstats, llvm::Function* pFunc);
 
+        void UpdateVariable(llvm::Value* Org, llvm::Value* New);
         void CollectMem2Reg(llvm::AllocaInst* pAllocaInst, IGC::StatusPrivArr2Reg status);
 
         void CollectLoopCyclomaticComplexity(
@@ -99,7 +100,7 @@ namespace IGCMetrics
 
         void CollectNonUniformLoop(llvm::Function* pFunc, short LoopCount, llvm::Loop* problematicLoop);
 
-        void CollectDataFromDebugInfo(IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pDebugDecoder);
+        void CollectDataFromDebugInfo(llvm::Function* pFunc, IGC::DebugInfoData *pDebugInfo, const IGC::VISADebugInfo *pDebugDecoder);
 
         void FinalizeStats();
 

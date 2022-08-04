@@ -40,6 +40,7 @@ typedef unsigned int uint;
 #define SIZE_WORD   2
 #define SIZE_DWORD  4
 #define SIZE_OWORD 16
+#define SIZE_YWORD 32
 
 enum ADDRESS_SPACE : unsigned int;
 
@@ -465,7 +466,7 @@ namespace IGC
         {
             hwThreadPerWorkgroup = std::min(platform.getMaxNumberThreadPerWorkgroupPooledMax(), (unsigned)64);
         }
-        return hwThreadPerWorkgroup;
+        return hwThreadPerWorkgroup ? hwThreadPerWorkgroup : 1;
     }
 
     inline SIMDMode getLeastSIMDAllowed(unsigned int threadGroupSize, unsigned int hwThreadPerWorkgroup)

@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #define DEBUG_TYPE "vc-transform-arg-copy"
 
 #include "llvmWrapper/Analysis/CallGraph.h"
+#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/CallSite.h"
 #include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/Instructions.h"
@@ -114,7 +115,7 @@ static bool isPtrArgModified(const Value &Arg) {
 // Check if it is safe to pass structure by value.
 static bool structSafeToPassByVal(const Argument &Arg) {
   StructType *StrTy =
-      cast<StructType>(cast<PointerType>(Arg.getType())->getElementType());
+      cast<StructType>(cast<PointerType>(Arg.getType())->getPointerElementType());
 
   if (!containsOnlySuitableTypes(*StrTy))
     return false;
@@ -155,7 +156,7 @@ static bool argToTransform(const Argument &Arg,
   auto *PtrTy = dyn_cast<PointerType>(Arg.getType());
   if (!PtrTy)
     return false;
-  Type *ElemTy = PtrTy->getElementType();
+  Type *ElemTy = PtrTy->getPointerElementType();
   if ((ElemTy->isVectorTy() || onlyUsedBySimpleValueLoadStore(Arg)) &&
       (ElemTy->isIntOrIntVectorTy() || ElemTy->isFPOrFPVectorTy()))
     return true;
@@ -371,19 +372,19 @@ vc::TransformedFuncInfo::gatherAttributes(LLVMContext &Context,
     if (OrigArgInfoEntry.getKind() == ArgKind::General) {
       IGC_ASSERT_MESSAGE(!OrigArgInfoEntry.isOmittedArg(),
                          "unexpected omitted argument");
-      AttributeSet ArgAttrs = AL.getParamAttributes(OrigIdx);
+      AttributeSet ArgAttrs = IGCLLVM::getParamAttrs(AL, OrigIdx);
       if (ArgAttrs.hasAttributes())
         GatheredAttrs = GatheredAttrs.addParamAttributes(
-            Context, OrigArgInfoEntry.getNewIdx(), AttrBuilder{ArgAttrs});
+            Context, OrigArgInfoEntry.getNewIdx(),
+            IGCLLVM::AttrBuilder{Context, ArgAttrs});
     }
   }
 
   // Gather function attributes.
-  AttributeSet FnAttrs = AL.getFnAttributes();
+  AttributeSet FnAttrs = IGCLLVM::getFnAttrs(AL);
   if (FnAttrs.hasAttributes()) {
-    AttrBuilder B(FnAttrs);
-    GatheredAttrs =
-        GatheredAttrs.addAttributes(Context, AttributeList::FunctionIndex, B);
+    IGCLLVM::AttrBuilder B(Context, FnAttrs);
+    GatheredAttrs = IGCLLVM::addAttributesAtIndex(GatheredAttrs, Context, AttributeList::FunctionIndex, B);
   }
 
   return GatheredAttrs;
@@ -499,7 +500,7 @@ getTransformedFuncCallArgs(CallInst &OrigCall,
 static AttributeList
 inheritCallAttributes(CallInst &OrigCall, int NumOrigFuncArgs,
                       const TransformedFuncInfo &NewFuncInfo) {
-  IGC_ASSERT_MESSAGE(OrigCall.getNumArgOperands() == NumOrigFuncArgs,
+  IGC_ASSERT_MESSAGE(IGCLLVM::getNumArgOperands(&OrigCall) == NumOrigFuncArgs,
                      "varargs aren't supported");
 
   const AttributeList &CallPAL = OrigCall.getAttributes();

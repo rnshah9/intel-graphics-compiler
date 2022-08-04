@@ -301,13 +301,14 @@ namespace IGC
             CVariable* pU, CVariable* pV, CVariable* pR, CVariable* pLOD,
             CVariable* pSrcDst,
             unsigned elemSize, unsigned numElems,
-            LSC_ADDR_SIZE addr_size, int chMask);
+            LSC_ADDR_SIZE addr_size, int chMask,
+            LSC_CACHE_OPTS cacheOpts = { LSC_CACHING_DEFAULT, LSC_CACHING_DEFAULT });
 
         void ScatterA64(CVariable* val, CVariable* offset, unsigned elementSize, unsigned numElems);
         void ByteGather(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset, unsigned elementSize, unsigned numElems);
         void ByteScatter(CVariable* src, const ResourceDescriptor& resource, CVariable* offset, unsigned elementSize, unsigned numElems);
-        void Gather4Scaled(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset);
-        void Gather4ScaledNd(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset, unsigned nd);
+        void Gather4Scaled(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset, unsigned Mask = 0);
+        void Gather4ScaledNd(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset, unsigned nd, unsigned Mask = 0);
         void Scatter4Scaled(CVariable* src, const ResourceDescriptor& resource, CVariable* offset);
         void Gather4A64(CVariable* dst, CVariable* offset);
         void Scatter4A64(CVariable* src, CVariable* offset);
@@ -471,8 +472,6 @@ namespace IGC
         void SetRoundingMode_FP(ERoundingMode actualRM, ERoundingMode newRM);
         void SetRoundingMode_FPCvtInt(ERoundingMode actualRM, ERoundingMode newRM);
 
-        void SetPreemptionMode(EPreemptionMode actualPreemptionMode, EPreemptionMode newPreemptionMode);
-
         static uint GetCISADataTypeSize(VISA_Type type) {return CVariable::GetCISADataTypeSize(type);}
         static e_alignment GetCISADataTypeAlignment(VISA_Type type) {return CVariable::GetCISADataTypeAlignment(type);}
 
@@ -619,12 +618,12 @@ namespace IGC
 
         // CreateRelocationTable
         // input/output: buffer, bufferSize, tableEntries: for patch-token-based format.
-        void CreateRelocationTable(void*& buffer, unsigned& bufferSize, unsigned& tableEntries);
+        void CreateRelocationTable(VISAKernel* pMainKernel, void*& buffer, unsigned& bufferSize, unsigned& tableEntries);
         // input/output: relocations: for ZEBinary foramt
-        void CreateRelocationTable(SProgramOutput::RelocListTy& relocations);
+        void CreateRelocationTable(VISAKernel* pMainKernel, SProgramOutput::RelocListTy& relocations);
 
         // CreateFuncAttributeTable
-        void CreateFuncAttributeTable(void*& buffer, unsigned& bufferSize, unsigned& tableEntries, SProgramOutput::FuncAttrListTy& attrs);
+        void CreateFuncAttributeTable(VISAKernel* pMainKernel, void*& buffer, unsigned& bufferSize, unsigned& tableEntries, SProgramOutput::FuncAttrListTy& attrs);
 
         // CreateGlobalHostAccessTable
         typedef std::vector<vISA::HostAccessEntry> HostAccessList;
@@ -671,17 +670,6 @@ namespace IGC
         // Get Encoding bit values for rounding mode
         RMEncoding getEncoderRoundingMode_FP(ERoundingMode FP_RM);
         RMEncoding getEncoderRoundingMode_FPCvtInt(ERoundingMode FCvtI_RM);
-
-        enum PreemptionEncoding
-        {
-            PreemptionDisabled = 0x000,
-            PreemptionEnabled = 0x800
-        };
-
-        PreemptionEncoding getEncoderPreemptionMode(EPreemptionMode preemptionMode);
-
-        void SetPreemptionMode(PreemptionEncoding actualPreemptionMode, PreemptionEncoding newPreemptionMode);
-
         unsigned GetRawOpndSplitOffset(VISA_Exec_Size fromExecSize,
             VISA_Exec_Size toExecSize,
             unsigned thePart, CVariable* var) const;

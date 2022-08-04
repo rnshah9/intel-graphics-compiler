@@ -106,7 +106,7 @@ std::unique_ptr<IGCLLVM::Module> LocalCloneModule(
         if (VMap.find(&*I) == VMap.end())
         {
             GlobalVariable *GV = new GlobalVariable(*New,
-                I->getType()->getElementType(),
+                I->getType()->getPointerElementType(),
                 I->isConstant(), I->getLinkage(),
                 (Constant*) nullptr, I->getName(),
                 (GlobalVariable*) nullptr,
@@ -177,7 +177,8 @@ std::unique_ptr<IGCLLVM::Module> LocalCloneModule(
             }
 
             SmallVector<ReturnInst*, 8> Returns;  // Ignore returns cloned.
-            IGCLLVM::CloneFunctionInto(F, &*I, VMap, /*ModuleLevelChanges=*/true, Returns);
+            IGCLLVM::CloneFunctionInto(F, &*I, VMap,
+                IGCLLVM::CloneFunctionChangeType::DifferentModule, Returns);
         }
 
         if (I->hasPersonalityFn())

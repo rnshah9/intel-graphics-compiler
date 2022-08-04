@@ -120,6 +120,8 @@ private:
     // closest-hit shader, return it. Otherwise, if there are differences or
     // no closest-hit shader at all, return None.
     Optional<std::string> getUniqueClosestHit(const Function& F) const;
+    void LowerPayload(
+        Function *F, RTArgs &Args, RTBuilder::SWStackPtrVal* FrameAddr);
 };
 
 enum class ANYHIT_RETURN_CODES
@@ -447,7 +449,7 @@ CallInst* LowerIntersectionAnyHit::codeGenReportHit(
                 CustomHitAttrPtr,
                 4,
                 Attrs,
-                std::min(4U, DL.getABITypeAlignment(AttrTy->getPointerElementType())),
+                std::min(4U, (unsigned)DL.getABITypeAlignment(AttrTy->getPointerElementType())),
                 IRB.getInt64(DL.getTypeAllocSize(AttrTy->getPointerElementType())));
         }
 
@@ -750,6 +752,22 @@ void LowerIntersectionAnyHit::createCallStackHandler(Module &M)
     markAsCallableShader(F, CallStackHandler);
 }
 
+void LowerIntersectionAnyHit::LowerPayload(
+    Function* F, RTArgs& Args, RTBuilder::SWStackPtrVal* FrameAddr)
+{
+    auto *PayloadPtr = RTBuilder::LowerPayload(F, Args, FrameAddr);
+    if (!PayloadPtr || !m_CGCtx->tryPayloadSinking())
+        return;
+
+    RTBuilder RTB(PayloadPtr->getNextNode(), *m_CGCtx);
+
+    auto* II = RTB.getPayloadPtrIntrinsic(
+        UndefValue::get(PayloadPtr->getType()),
+        FrameAddr);
+    PayloadPtr->replaceAllUsesWith(II);
+    II->setPayloadPtr(PayloadPtr);
+}
+
 // For each procedural any-hit shader, we will:
 // 1. create a new function with an i32 return type.
 // 2. splice the code from the original to the new.
@@ -799,7 +817,7 @@ Function* LowerIntersectionAnyHit::createAnyHitFn(
         HIT_GROUP_TYPE::PROCEDURAL_PRIMITIVE,
         m_CGCtx, MD, MD.rtInfo.Types);
 
-    RTBuilder::LowerPayload(NewFunc, Args, FrameAddr);
+    LowerPayload(NewFunc, Args, FrameAddr);
     RTBuilder::loadCustomHitAttribsFromStack(*NewFunc, Args, FrameAddr);
 
     SmallVector<GenIntrinsicInst*, 4> IgnoreHits;
@@ -1080,6 +1098,7 @@ void LowerIntersectionAnyHit::handleIntersectionAnyHitShaders(Module &M)
                     ReportHits.push_back(ReportHit);
             }
 
+            SmallVector<AllocaInst*, 4> inlinedStaticArrayAllocas;
             for (auto* RHI : ReportHits)
             {
                 auto *AnyHitCall = codeGenReportHit(
@@ -1090,6 +1109,34 @@ void LowerIntersectionAnyHit::handleIntersectionAnyHitShaders(Module &M)
                     bool CanInline = IGCLLVM::InlineFunction(AnyHitCall, IFI);
                     CanInline = CanInline;
                     IGC_ASSERT_MESSAGE(CanInline, "failed to inline?");
+                    // Merge static array allocas to reduce the use of private
+                    // memory. This is a similar optimization that exists in
+                    // the inliner, see mergeInlinedArrayAllocas().
+                    if (inlinedStaticArrayAllocas.empty())
+                    {
+                        for (AllocaInst* allocaInst : IFI.StaticAllocas)
+                        {
+                            if (!allocaInst->isArrayAllocation() &&
+                                allocaInst->getAllocatedType()->isArrayTy())
+                            {
+                                inlinedStaticArrayAllocas.push_back(allocaInst);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        auto it = inlinedStaticArrayAllocas.begin();
+                        for (AllocaInst* allocaInst : IFI.StaticAllocas)
+                        {
+                            if (!allocaInst->isArrayAllocation() &&
+                                allocaInst->getAllocatedType()->isArrayTy())
+                            {
+                                IGC_ASSERT((*it)->getAllocatedType() == allocaInst->getAllocatedType());
+                                allocaInst->replaceAllUsesWith(*it);
+                                ++it;
+                            }
+                        }
+                    }
                 }
             }
         }

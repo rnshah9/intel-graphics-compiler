@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -42,7 +42,6 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "GENX_PATTERN_MATCH"
 #include "GenX.h"
 #include "GenXConstants.h"
 #include "GenXModule.h"
@@ -63,7 +62,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
-#include "llvm/IR/Instructions.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
@@ -75,6 +74,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
+#include "llvmWrapper/ADT/APInt.h"
 #include "llvmWrapper/IR/Constants.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/Support/TypeSize.h"
@@ -92,6 +92,9 @@ SPDX-License-Identifier: MIT
 using namespace llvm;
 using namespace llvm::PatternMatch;
 using namespace genx;
+using namespace vc;
+
+#define DEBUG_TYPE "GENX_PATTERN_MATCH"
 
 STATISTIC(NumOfMadMatched, "Number of mad instructions matched");
 STATISTIC(NumOfMinMaxMatched, "Number of min/max instructions matched");
@@ -622,7 +625,7 @@ void GenXPatternMatch::visitICmpInst(ICmpInst &I) {
         BC->setDebugLoc(I.getDebugLoc());
 
         // Create the new rdregion.
-        Region R(BC);
+        vc::Region R(BC);
         R.NumElements = NElts;
         R.Stride = Stride;
         R.Width = NElts;
@@ -771,7 +774,7 @@ CmpInst *GenXPatternMatch::reduceCmpWidth(CmpInst *Cmp) {
   auto *VTy = cast<IGCLLVM::FixedVectorType>(V0->getType());
   unsigned NumElts = VTy->getNumElements();
 
-  Region R = makeRegionFromBaleInfo(WII, BaleInfo());
+  auto R = makeRegionFromBaleInfo(WII, BaleInfo());
   if (R.Indirect || R.Offset || R.VStride || R.Stride != 1 ||
       R.Width != NumElts)
     return nullptr;
@@ -928,7 +931,7 @@ bool GenXPatternMatch::matchInverseSqrt(Instruction *I) {
 
   // Leave as it if sqrt has multiple uses:
   // generating rsqrt operation is not beneficial
-  if (OpInst->getNumUses() > 1)
+  if (OpInst->hasNUsesOrMore(2))
     return false;
 
   auto *Rsqrt = createInverseSqrt(OpInst->getOperand(0), I->getNextNode());
@@ -1069,7 +1072,7 @@ bool GenXPatternMatch::foldBoolAnd(Instruction *Inst) {
     return false;
   // Fold and into wrregion, giving rdregion, select and wrregion, as long
   // as the original wrregion is not indirect.
-  Region R = makeRegionFromBaleInfo(user, BaleInfo());
+  auto R = makeRegionFromBaleInfo(user, BaleInfo());
   if (R.Indirect)
     return false;
   auto NewRdRegion =
@@ -1138,14 +1141,14 @@ bool MadMatcher::isProfitable() const {
   auto isIndirectRdRegion = [](Value *V) -> bool {
     if (!GenXIntrinsic::isRdRegion(V))
       return false;
-    Region R = makeRegionFromBaleInfo(cast<Instruction>(V), BaleInfo());
+    auto R = makeRegionFromBaleInfo(cast<Instruction>(V), BaleInfo());
     return R.Indirect;
   };
 
   auto isIndirectWrRegion = [](User *U) -> bool {
     if (!GenXIntrinsic::isWrRegion(U))
       return false;
-    Region R = makeRegionFromBaleInfo(cast<Instruction>(U), BaleInfo());
+    auto R = makeRegionFromBaleInfo(cast<Instruction>(U), BaleInfo());
     return R.Indirect;
   };
 
@@ -1244,7 +1247,7 @@ static Value *getBroadcastFromScalar(Value *V) {
   if (!GenXIntrinsic::isRdRegion(V))
     return nullptr;
   GenXIntrinsicInst *RII = cast<GenXIntrinsicInst>(V);
-  Region R = makeRegionFromBaleInfo(RII, BaleInfo());
+  auto R = makeRegionFromBaleInfo(RII, BaleInfo());
   if (!R.isScalar() || R.Width != 1 || R.Offset != 0)
     return nullptr;
   Value *Src = RII->getArgOperand(0);
@@ -1315,7 +1318,7 @@ MadMatcher::getNarrowI16Vector(IRBuilder<> &Builder, Instruction *AInst,
       // Broadcast through rdregion.
       Type *NewTy = IGCLLVM::FixedVectorType::get(V->getType(), 1);
       V = Builder.CreateBitCast(V, NewTy);
-      Region R(V);
+      vc::Region R(V);
       R.Offset = 0;
       R.Width = 1;
       R.Stride = R.VStride = 0;
@@ -1535,7 +1538,7 @@ bool MadMatcher::emit() {
       Type *NewTy = IGCLLVM::FixedVectorType::get(V->getType(), 1);
       V = Builder.CreateBitCast(V, NewTy);
       // Broadcast through rdregin.
-      Region R(V);
+      vc::Region R(V);
       R.Offset = 0;
       R.Width = 1;
       R.Stride = R.VStride = 0;
@@ -1730,7 +1733,7 @@ Value *SplatValueIfNecessary(Value *V, IGCLLVM::FixedVectorType *VTy,
   Type *NewTy = IGCLLVM::FixedVectorType::get(V->getType(), 1);
   V = Builder.CreateBitCast(V, NewTy);
   // Broadcast through rdregin.
-  Region R(V);
+  vc::Region R(V);
   R.Offset = 0;
   R.Width = 1;
   R.Stride = R.VStride = 0;
@@ -2331,8 +2334,8 @@ bool GenXPatternMatch::propagateFoldableRegion(Function *F) {
         GenXIntrinsicInst *WII = cast<GenXIntrinsicInst>(User);
         if (WII->getOperand(1) != Mul)
           continue;
-        Region W = makeRegionFromBaleInfo(WII, BaleInfo());
-        Region V(Mul);
+        auto W = makeRegionFromBaleInfo(WII, BaleInfo());
+        vc::Region V(Mul);
         // TODO: Consider the broadcast and similar cases.
         if (!W.isStrictlySimilar(V))
           continue;
@@ -2347,7 +2350,7 @@ bool GenXPatternMatch::propagateFoldableRegion(Function *F) {
           for (auto *U : II->users()) {
             if (GenXIntrinsic::isRdRegion(U)) {
               GenXIntrinsicInst *RII = cast<GenXIntrinsicInst>(U);
-              Region R = makeRegionFromBaleInfo(RII, BaleInfo());
+              auto R = makeRegionFromBaleInfo(RII, BaleInfo());
               if (R == W) {
                 for (auto *U2 : RII->users())
                   if (!Ring.isAdd(U2)) {
@@ -2363,7 +2366,7 @@ bool GenXPatternMatch::propagateFoldableRegion(Function *F) {
               }
             } else if (GenXIntrinsic::isWrRegion(U)) {
               GenXIntrinsicInst *WII2 = cast<GenXIntrinsicInst>(U);
-              Region W2 = makeRegionFromBaleInfo(WII2, BaleInfo());
+              auto W2 = makeRegionFromBaleInfo(WII2, BaleInfo());
               if (W2 == W) {
                 // No more wrregion needs tracing. DO NOTHING.
               } else if (W2.overlap(W)) {
@@ -2513,7 +2516,7 @@ bool GenXPatternMatch::simplifyWrRegion(CallInst *Inst) {
       IRBuilder<> B(Inst);
       NewV = B.CreateBitCast(NewV, IGCLLVM::FixedVectorType::get(NewVTy, 1));
     }
-    Region R(Inst->getType());
+    vc::Region R(Inst->getType());
     R.Width = R.NumElements;
     R.Stride = 0;
     NewV = R.createRdRegion(NewV, "splat", Inst, Inst->getDebugLoc(),
@@ -2693,7 +2696,7 @@ static bool mergeToWrRegion(SelectInst *SI) {
 
     Rd = cast<CallInst>(Val);
     Inverted = Val == SI->getTrueValue();
-    Region RdReg = makeRegionFromBaleInfo(Rd, BaleInfo());
+    auto RdReg = makeRegionFromBaleInfo(Rd, BaleInfo());
 
     auto CanMergeToWrRegion = [&](const Use &U) -> bool {
       if (!GenXIntrinsic::isWrRegion(U.getUser()))
@@ -2701,7 +2704,7 @@ static bool mergeToWrRegion(SelectInst *SI) {
       if (U.getOperandNo() != NewValueOperandNum)
         return false;
       CallInst *Wr = cast<CallInst>(U.getUser());
-      Region WrReg = makeRegionFromBaleInfo(Wr, BaleInfo());
+      auto WrReg = makeRegionFromBaleInfo(Wr, BaleInfo());
       if (WrReg.Mask) {
         // If wrregion already has mask, it should be all ones constant.
         auto *C = dyn_cast<Constant>(WrReg.Mask);
@@ -2731,7 +2734,7 @@ static bool mergeToWrRegion(SelectInst *SI) {
       if (Inverted)
         Mask = llvm::genx::invertCondition(Mask);
       // Create new wrregion.
-      Region WrReg = makeRegionFromBaleInfo(Wr, BaleInfo());
+      auto WrReg = makeRegionFromBaleInfo(Wr, BaleInfo());
       WrReg.Mask = Mask;
       Value *NewWr = WrReg.createWrRegion(Rd->getOperand(OldValueOperandNum),
                                           Inverted ? SI->getFalseValue()
@@ -2963,34 +2966,34 @@ static void decomposeUDivNotPow2(BinaryOperator &UDivOp) {
                 : cast<ConstantInt>(Divisor))
           ->getValue();
 
-  APInt::mu MagicStruct = DivisorVal.magicu();
+  IGCLLVM::UnsignedDivisonByConstantInfo MagicStruct = IGCLLVM::getAPIntMagicUnsigned(DivisorVal);
   const int ElementBitWidth =
       Divisor->getType()->getScalarType()->getIntegerBitWidth();
   // Even divisors, can pre-shift the dividend to avoid
   // extra work at the end.
   Value *ShiftedDividend = Dividend;
   // Need addition and y is 2 * y'.
-  if (MagicStruct.a && !DivisorVal[0]) {
+  if (IGCLLVM::IsAddition(MagicStruct) && !DivisorVal[0]) {
     unsigned ShiftSizeRaw = DivisorVal.countTrailingZeros();
     Constant *ShiftSize =
         Constant::getIntegerValue(OperationTy, APInt{32, ShiftSizeRaw});
     ShiftedDividend = Builder.CreateLShr(ShiftedDividend, ShiftSize);
-    MagicStruct = DivisorVal.lshr(ShiftSizeRaw).magicu(ShiftSizeRaw);
+    MagicStruct = IGCLLVM::getAPIntMagicUnsigned(DivisorVal.lshr(ShiftSizeRaw), ShiftSizeRaw);
 
     // Should not change addition quality.
-    IGC_ASSERT_MESSAGE(!MagicStruct.a, "expected to subtract now");
-    IGC_ASSERT_MESSAGE(MagicStruct.s < DivisorVal.getBitWidth(),
+    IGC_ASSERT_MESSAGE(!IGCLLVM::IsAddition(MagicStruct), "expected to subtract now");
+    IGC_ASSERT_MESSAGE(IGCLLVM::ShiftAmount(MagicStruct) < DivisorVal.getBitWidth(),
                        "undefined shift");
   }
-  Constant *MagicConst = Constant::getIntegerValue(OperationTy, MagicStruct.m);
+  Constant *MagicConst = Constant::getIntegerValue(OperationTy, IGCLLVM::MagicNumber(MagicStruct));
   Value *MulH = vc::createAnyIntrinsic(Builder, {ShiftedDividend, MagicConst},
                                         GenXIntrinsic::genx_umulh,
                                         {OperationTy, OperationTy}, "opt");
 
   Value *Res = nullptr;
-  if (!MagicStruct.a) {
+  if (!IGCLLVM::IsAddition(MagicStruct)) {
     Constant *Shift =
-        Constant::getIntegerValue(OperationTy, APInt{32, MagicStruct.s});
+        Constant::getIntegerValue(OperationTy, APInt{32, IGCLLVM::ShiftAmount(MagicStruct)});
     Res = Builder.CreateLShr(MulH, Shift);
   } else {
     Value *Fixup = Builder.CreateSub(Dividend, MulH, "q_appx");
@@ -2998,7 +3001,7 @@ static void decomposeUDivNotPow2(BinaryOperator &UDivOp) {
     Fixup = Builder.CreateLShr(Fixup, One);
     Value *Addition = Builder.CreateAdd(Fixup, MulH, "q_appx_add");
     Constant *Shift =
-        Constant::getIntegerValue(OperationTy, APInt{32, MagicStruct.s - 1});
+        Constant::getIntegerValue(OperationTy, APInt{32, IGCLLVM::ShiftAmount(MagicStruct) - 1});
     Res = Builder.CreateLShr(Addition, Shift);
   }
   IGC_ASSERT(Res);
@@ -3394,7 +3397,7 @@ bool GenXPatternMatch::vectorizeConstants(Function *F) {
       unsigned NumOpnds = Inst->getNumOperands();
       auto CI = dyn_cast<CallInst>(Inst);
       if (CI)
-        NumOpnds = CI->getNumArgOperands();
+        NumOpnds = IGCLLVM::getNumArgOperands(CI);
       for (unsigned i = 0, e = NumOpnds; i != e; ++i) {
         auto C = dyn_cast<Constant>(Inst->getOperand(i));
         if (!C || isa<UndefValue>(C))
@@ -3431,7 +3434,7 @@ bool GenXPatternMatch::vectorizeConstants(Function *F) {
           IRBuilder<> Builder(Inst);
           unsigned Width = cast<IGCLLVM::FixedVectorType>(ShtAmt[0]->getType())
                                ->getNumElements();
-          Region R(C->getType());
+          vc::Region R(C->getType());
           R.getSubregion(0, Width);
           Value *Val = UndefValue::get(C->getType());
           Val = R.createWrRegion(Val, Base, "", Inst, Inst->getDebugLoc());
@@ -3439,7 +3442,7 @@ bool GenXPatternMatch::vectorizeConstants(Function *F) {
             auto Opc = C->getType()->isFPOrFPVectorTy() ? Instruction::FAdd
                                                         : Instruction::Add;
             auto Input = Builder.CreateBinOp(Opc, Base, ShtAmt[j]);
-            Region R1(C->getType());
+            vc::Region R1(C->getType());
             R1.getSubregion(Width * j, Width);
             Val = R1.createWrRegion(Val, Input, "", Inst, Inst->getDebugLoc());
           }
@@ -3593,14 +3596,14 @@ bool GenXPatternMatch::placeConstants(Function *F) {
 }
 
 bool GenXPatternMatch::simplifyNullDst(CallInst *Inst) {
-  if (Inst->getNumUses() != 1)
+  if (!Inst->hasOneUse())
     return false;
 
   PHINode *Phi = dyn_cast<PHINode>(Inst->use_begin()->getUser());
   if (Phi == nullptr)
     return false;
 
-  if (Phi->getNumUses() == 1 && Phi->use_begin()->getUser() == Inst) {
+  if (Phi->hasOneUse() && Phi->use_begin()->getUser() == Inst) {
     Phi->replaceAllUsesWith(UndefValue::get(Phi->getType()));
     Phi->eraseFromParent();
     return true;

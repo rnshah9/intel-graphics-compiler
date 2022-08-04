@@ -317,7 +317,7 @@ uint32_t DepSet::getDPASOpsPerChan(Type src1_ty, Type src2_ty)
         IGA_ASSERT(src1_ty == src2_ty, "src1/src2 must have the same type");
         return 2;
     }
-    else if (src1_ty == Type::BF8) {
+    else if (src1_ty == Type::BF8 || src1_ty == Type::HF8) {
         IGA_ASSERT(src1_ty == src2_ty, "src1/src2 must have the same type");
         return 4;
     }
@@ -449,14 +449,13 @@ void DepSet::addDependency(const RegRangeListType& reg_range)
 }
 
 size_t DepSetBuilder::DpasMacroBuilder::getNumberOfSuppresionGroups(uint32_t srcIdx) const {
-    if (srcIdx == 1)
-        return m_model.platform > Platform::XE_HPC ? 2 : 1;
 
+    if (srcIdx == 1) {
+        return 1;
+    }
     if (srcIdx == 2) {
-        if (m_model.platform == Platform::XE_HPC)
+        if (m_model.platform >= Platform::XE_HPC)
             return 4;
-        if (m_model.platform > Platform::XE_HPC)
-            return 8;
     }
     return 0;
 }
@@ -1108,6 +1107,14 @@ void DepSet::setOutputsDstDep()
     const auto & op = m_instruction->getDestination();
     auto tType = op.getType();
     auto typeSizeBits = TypeSizeInBitsWithDefault(tType, 32);
+
+    // A trick to correct the call dst footprint that its dst type is implicit dw but it acutally writes to
+    // continuous two dw for each lane. Double the type size so that we will get the correct footprint in
+    // DepSet::setDstRegion
+    if (m_instruction->getOp() == Op::CALL || m_instruction->getOp() == Op::CALLA) {
+        assert(tType == Type::D && op.getKind() == Operand::Kind::DIRECT && op.getDirRegName() == RegName::GRF_R);
+        typeSizeBits = typeSizeBits * 2;
+    }
 
     // Instructions having implicit write to acc
     if (m_instruction->hasInstOpt(InstOpt::ACCWREN) ||

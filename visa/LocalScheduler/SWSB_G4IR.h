@@ -86,12 +86,20 @@ namespace vISA {
         std::vector<vISA::SBNode*> exclusiveNodes;
     };
 
-   struct SBDISTDep {
-       SB_INST_PIPE liveNodePipe;
-       SB_INST_PIPE nodePipe;
-       SB_INST_PIPE operandType;
-       bool dstDep;
-   };
+    struct SBDISTDep {
+        SB_INST_PIPE liveNodePipe;
+        SB_INST_PIPE nodePipe;
+        SB_INST_PIPE operandType;
+        bool dstDep;
+    };
+
+    struct DistDepValue {
+        unsigned short intDist : 3;
+        unsigned short floatDist : 3;
+        unsigned short longDist : 3;
+        unsigned short mathDist : 3;
+        unsigned short scalarDist : 3;
+    };
 
     using SWSBTokenType = G4_INST::SWSBTokenType;
     void singleInstStallSWSB(G4_Kernel *kernel, uint32_t instID, uint32_t endInstID, bool is_barrier);
@@ -105,6 +113,8 @@ typedef SBDEP_VECTOR::iterator SBDEP_VECTOR_ITER;
 
 typedef vISA::SBDISTDep SBDISTDEP_ITEM;
 typedef std::vector< SBDISTDEP_ITEM> SBDISTDEP_VECTOR;
+
+typedef vISA::DistDepValue DISTDEPINFO;
 
 namespace vISA
 {
@@ -219,7 +229,6 @@ namespace vISA
             return false;
         }
 
-
         //Check if current footprint overlaps footprint2
         //FIXME: it's conservative. Because for the indirect, the ranges may be contiguous?
         bool isWholeOverlap(const SBFootprint *liveFootprint) const
@@ -254,6 +263,38 @@ namespace vISA
             }
 
             return findOverlap;
+        }
+
+        // check if the current footprint has the same range with given one, or they are not overlapped at all
+        bool isSameOrNoOverlap(const SBFootprint* liveFootprint) const
+        {
+            unsigned short offset = 0;
+            if (!hasOverlap(liveFootprint, offset))
+                return true;
+
+
+            for (const SBFootprint* footprint2Ptr = liveFootprint; footprint2Ptr; footprint2Ptr = footprint2Ptr->next)
+            {
+                if (fType == footprint2Ptr->fType &&
+                    LeftB == footprint2Ptr->LeftB && RightB == footprint2Ptr->RightB)
+                    continue;
+
+                bool findSame = false;
+                for (const SBFootprint* curFootprintPtr = next; curFootprintPtr; curFootprintPtr = curFootprintPtr->next)
+                {
+                    FOOTPRINT_TYPE curFType = curFootprintPtr->fType;
+                    if (curFType == footprint2Ptr->fType &&
+                        curFootprintPtr->LeftB == footprint2Ptr->LeftB && curFootprintPtr->RightB == footprint2Ptr->RightB)
+                    {
+                        findSame = true;
+                        break;
+                    }
+                }
+
+                if (!findSame)
+                    return false;
+            }
+            return true;
         }
 
     };
@@ -397,6 +438,11 @@ namespace vISA
         SBNode *       tokenReusedNode = nullptr;  // For global token reuse optimization, the node whose token is reused by current one.
         SB_INST_PIPE   ALUPipe;
         SBDISTDEP_VECTOR  distDep;
+        union {
+            DISTDEPINFO info;
+            unsigned short value;
+        } distInfo;
+
         SBBitSets reachingSends;
         SBBitSets reachedUses;
         unsigned reuseOverhead = 0;
@@ -412,6 +458,7 @@ namespace vISA
             footprints(Opnd_total_num, nullptr)
         {
             ALUPipe = PIPE_NONE;
+            clearAllDistInfo();
             if (i->isDpas())
             {
                 G4_InstDpas* dpasInst = i->asDpasInst();
@@ -586,15 +633,16 @@ namespace vISA
             return footprints[opndNum];
         }
 
-        void setDistance(unsigned distance)
+        unsigned setDistance(unsigned s)
         {
-            distance = std::min(distance, SWSB_MAX_ALU_DEPENDENCE_DISTANCE_VALUE);
+            unsigned distance = std::min(s, SWSB_MAX_ALU_DEPENDENCE_DISTANCE_VALUE);
             unsigned curDistance = (unsigned)instVec.front()->getDistance();
             if (curDistance == 0 ||
                 curDistance > distance)
             {
                 instVec.front()->setDistance((unsigned char)distance);
             }
+            return distance;
         }
 
         void setAccurateDistType(SB_INST_PIPE depPipe)
@@ -622,46 +670,158 @@ namespace vISA
             }
         }
 
-        //This is to reduce the sync instructions.
-        //When A@1 is used to replace I@1, make sure it will not cause the stall for float or long pipelines
-        bool isClosedALUType(std::vector<unsigned>** latestInstID, unsigned distance, SB_INST_PIPE type)
+        unsigned getDistInfo(SB_INST_PIPE depPipe)
         {
-            int instDist = SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
-            SB_INST_PIPE curType = PIPE_NONE;
-
-            for (int i = 1; i < PIPE_DPAS; i++)
+            switch (depPipe)
             {
-                int dist = SWSB_MAX_MATH_DEPENDENCE_DISTANCE + 1;
-                if (i == PIPE_INT || i == PIPE_FLOAT)
-                {
-                    if (latestInstID[i]->size() >= distance)
-                    {
-                        dist = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_ALU_DEPENDENCE_DISTANCE;
-                    }
-                }
-                if (i == PIPE_MATH)
-                {
-                    if (latestInstID[i]->size() >= distance)
-                    {
-                        dist = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
-                    }
-                }
-                if (i == PIPE_LONG)
-                {
-                    if (latestInstID[i]->size() >= distance)
-                    {
-                        dist = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_ALU_DEPENDENCE_DISTANCE_64BIT;
-                    }
-                }
+            case PIPE_INT:
+                return distInfo.info.intDist;
+            case PIPE_FLOAT:
+                return distInfo.info.floatDist;
+            case PIPE_LONG:
+                return distInfo.info.longDist;
+            case PIPE_MATH:
+                return distInfo.info.mathDist;
+            default:
+                assert(0 && "Wrong ALU PIPE");
+                return 0;
+            }
+        }
 
-                if (dist < instDist)
+        void setDistInfo(SB_INST_PIPE depPipe, unsigned distance)
+        {
+            switch (depPipe)
+            {
+            case PIPE_INT:
+                distInfo.info.intDist = (distInfo.info.intDist == 0 || distInfo.info.intDist > distance) ? distance :  distInfo.info.intDist;
+                break;
+            case PIPE_FLOAT:
+                distInfo.info.floatDist = (distInfo.info.floatDist == 0 || distInfo.info.floatDist > distance) ? distance : distInfo.info.floatDist;
+                break;
+            case PIPE_LONG:
+                distInfo.info.longDist = (distInfo.info.longDist == 0 || distInfo.info.longDist > distance) ? distance : distInfo.info.longDist;
+                break;
+            case PIPE_MATH:
+                distInfo.info.mathDist = (distInfo.info.mathDist == 0 || distInfo.info.mathDist > distance) ? distance : distInfo.info.mathDist;
+                break;
+            default:
+                assert(0 && "Wrong ALU PIPE");
+                break;
+            }
+        }
+
+        bool hasDistInfo() const
+        {
+            return distInfo.value != 0;
+        }
+
+        void clearAllDistInfo()
+        {
+            distInfo.value = 0;
+        }
+
+        void clearDistInfo(SB_INST_PIPE depPipe)
+        {
+            switch (depPipe)
+            {
+            case PIPE_INT:
+                distInfo.info.intDist = 0;
+                break;
+            case PIPE_FLOAT:
+                distInfo.info.floatDist = 0;
+                break;
+            case PIPE_LONG:
+                distInfo.info.longDist = 0;
+                break;
+            case PIPE_MATH:
+                distInfo.info.mathDist = 0;
+                break;
+            default:
+                assert(0 && "Wrong ALU PIPE");
+                break;
+            }
+        }
+
+        // Calculate the difference between the inst distance and the ALU pipe
+        // dependence distance. The inst distance is the distance between the
+        // current inst and the dependent inst in the ALU pipe, and the ALU
+        // dependence distance is used to check for potential stall. So, the
+        // diff value can indicate a stall if the diff is negative, and no
+        // stall if it is 0 or positive.
+        int calcDiffBetweenInstDistAndPipeDepDist(std::vector<unsigned>** latestInstID,
+            unsigned distance, SB_INST_PIPE type)
+        {
+            int i = static_cast<int>(type);
+            assert(latestInstID[i]->size() >= distance);
+            int diff = SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
+            if (i == PIPE_INT || i == PIPE_FLOAT)
+            {
+                diff = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_ALU_DEPENDENCE_DISTANCE;
+            }
+            if (i == PIPE_MATH)
+            {
+                diff = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
+            }
+            if (i == PIPE_LONG)
+            {
+                diff = (int)nodeID - (*latestInstID[i])[latestInstID[i]->size() - distance] - SWSB_MAX_ALU_DEPENDENCE_DISTANCE_64BIT;
+            }
+            return diff;
+        }
+
+        // Calculate the closest dependent ALU pipe and the distance diff value
+        // given a same dependent inst distance for each pipe.
+        std::pair<SB_INST_PIPE, int>
+        calcClosestALUAndDistDiff(std::vector<unsigned>** latestInstID, unsigned distance)
+        {
+            SB_INST_PIPE curType = PIPE_NONE;
+            int instDistDiff = SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
+
+            for (int i = PIPE_INT; i < PIPE_DPAS; i++)
+            {
+                if (latestInstID[i]->size() < distance)
+                    continue;
+
+                int diff = calcDiffBetweenInstDistAndPipeDepDist(latestInstID, distance, (SB_INST_PIPE)i);
+                if (diff < instDistDiff)
                 {
-                    instDist = dist;
+                    instDistDiff = diff;
                     curType = (SB_INST_PIPE)i;
                 }
             }
+            return std::make_pair(curType, instDistDiff);
+        }
 
-            return type == curType;
+        // Calculate the closest dependent ALU pipe and the distance diff value
+        // using the true dependence for each pipe.
+        std::pair<SB_INST_PIPE, int>
+        calcClosestALUAndDistDiff(std::vector<unsigned>** latestInstID)
+        {
+            SB_INST_PIPE curType = PIPE_NONE;
+            int instDistDiff = SWSB_MAX_MATH_DEPENDENCE_DISTANCE;
+
+            for (int i = PIPE_INT; i < PIPE_DPAS; i++)
+            {
+                unsigned dist = getDistInfo((SB_INST_PIPE)i);
+                if (dist == 0)
+                    continue;
+
+                int diff = calcDiffBetweenInstDistAndPipeDepDist(latestInstID, dist, (SB_INST_PIPE)i);
+                if (diff < instDistDiff)
+                {
+                    instDistDiff = diff;
+                    curType = (SB_INST_PIPE)i;
+                }
+            }
+            return std::make_pair(curType, instDistDiff);
+        }
+
+        //This is to reduce the sync instructions.
+        //When A@1 is used to replace I@1, make sure it will not cause the stall for float or long pipelines
+        bool isClosestALUType(std::vector<unsigned>** latestInstID, unsigned distance, SB_INST_PIPE type)
+        {
+            auto distAllDepRes = calcClosestALUAndDistDiff(latestInstID, distance);
+            return type == distAllDepRes.first;
         }
 
         void finalizeDistanceType1(IR_Builder& builder, std::vector<unsigned>** latestInstID)
@@ -792,7 +952,7 @@ namespace vISA
                     else //From same pipeline
                     {
                         setAccurateDistType(ALUPipe);
-                        instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, ALUPipe));
+                        instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, ALUPipe));
                     }
                 }
                 else //Only one dependency
@@ -802,7 +962,7 @@ namespace vISA
                         setAccurateDistType(depPipe);
                         if (sameOperandType || GetInstruction()->isSend())
                         {
-                            instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, depPipe));
+                            instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, depPipe));
                         }
                     }
                     else // From same pipeline
@@ -810,7 +970,7 @@ namespace vISA
                         setAccurateDistType(ALUPipe);
                         if (sameOperandType)
                         {
-                            instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, ALUPipe));
+                            instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, ALUPipe));
                         }
                     }
                 }
@@ -956,7 +1116,7 @@ namespace vISA
                     else //From same pipeline
                     {
                         setAccurateDistType(depPipe);
-                        instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, depPipe));
+                        instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, depPipe));
                     }
                 }
                 else //Only one dependency
@@ -966,7 +1126,7 @@ namespace vISA
                         setAccurateDistType(depPipe);
                         if (sameOperandType || GetInstruction()->isSend())
                         {
-                            instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, depPipe));
+                            instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, depPipe));
                         }
                     }
                     else // From same pipeline
@@ -974,9 +1134,92 @@ namespace vISA
                         setAccurateDistType(ALUPipe);
                         if (sameOperandType)
                         {
-                            instVec.front()->setIsClosestALUType(isClosedALUType(latestInstID, curDistance, ALUPipe));
+                            instVec.front()->setIsClosestALUType(isClosestALUType(latestInstID, curDistance, ALUPipe));
                         }
                     }
+                }
+            }
+        }
+
+        void finalizeDistanceType3(IR_Builder& builder, std::vector<unsigned>** latestInstID)
+        {
+            if (instVec.front()->getDistanceTypeXe() != G4_INST::DistanceType::DIST_NONE)
+            {   //Forced to a type already
+                clearAllDistInfo();
+                return;
+            }
+
+            if (builder.loadThreadPayload() && nodeID <= 8 &&
+                GetInstruction()->isSend() && hasDistInfo())
+            {
+                instVec.front()->setDistanceTypeXe(G4_INST::DistanceType::DISTALL);
+                clearAllDistInfo();
+                return;
+            }
+
+            if (builder.hasA0WARHWissue() && builder.hasFourALUPipes())
+            {
+                G4_INST* inst = GetInstruction();
+
+                if (inst->getDst() && inst->getDst()->isA0())
+                {
+                    instVec.front()->setDistance(1);
+                    instVec.front()->setDistanceTypeXe(G4_INST::DistanceType::DISTALL);
+                    clearAllDistInfo();
+                    return;
+                }
+            }
+
+            if (instVec.front()->getDistance() == 1 && (instVec.front()->getDistanceTypeXe() == G4_INST::DistanceType::DISTALL))
+            {
+                clearAllDistInfo();
+                return;
+            }
+
+            if (!hasDistInfo())
+            {
+                return;
+            }
+
+            // Check if there are multiple dependences and calculate the min
+            // distance used to compute the cost of DISTALL.
+            unsigned minDist = SWSB_MAX_ALU_DEPENDENCE_DISTANCE_VALUE;
+            unsigned numOfDep = 0;
+            for (int i = PIPE_INT; i < PIPE_DPAS; i++)
+            {
+                unsigned dist = getDistInfo((SB_INST_PIPE)i);
+                if (dist)
+                {
+                  minDist = std::min(minDist, dist);
+                  ++numOfDep;
+                }
+            }
+
+            if (numOfDep > 1)
+            {
+                // When the cost of using DISTALL dependence is same as the
+                // cost of calculating true dependence for each pipe, using
+                // DISTALL could save us from emitting sync.nop instructions.
+                auto distAllDepRes = calcClosestALUAndDistDiff(latestInstID, minDist);
+                auto trueDepRes = calcClosestALUAndDistDiff(latestInstID);
+                if (distAllDepRes.second == trueDepRes.second)
+                {
+                    instVec.front()->setDistance(minDist);
+                    instVec.front()->setDistanceTypeXe(G4_INST::DistanceType::DISTALL);
+                    clearAllDistInfo();
+                    return;
+                }
+            }
+
+            for (int i = PIPE_INT; i < PIPE_DPAS; i++)
+            {
+                unsigned dist = getDistInfo((SB_INST_PIPE)i);
+                if (dist)
+                {
+                    setAccurateDistType((SB_INST_PIPE)i);
+                    clearDistInfo((SB_INST_PIPE)i);
+                    instVec.front()->setDistance((unsigned char)dist);
+                    break;
                 }
             }
         }
@@ -1352,7 +1595,9 @@ namespace vISA
 
         int totalGRFNum;
         int tokenAfterDPASCycle;
-
+    private:
+        // dpas read suppression buffer size
+        unsigned short getDpasSrcCacheSize(Gen4_Operand_Number opNum) const;
     public:
         LiveGRFBuckets *send_use_kills;
         BB_SWSB_LIST      Preds;
@@ -1503,12 +1748,12 @@ namespace vISA
 
         void clearKilledBucketNodeXeHP(LiveGRFBuckets* LB, int integerID, int floatID, int longID, int mathID);
 
-        bool hasInternalDependenceWithinDPAS(SBNode *node);
+        bool hasInternalDependenceWithinDPAS(SBNode *node) const;
         bool hasDependenceBetweenDPASNodes(SBNode * node, SBNode * nextNode);
-        bool src2FootPrintCachePVC(SBNode* curNode, SBNode* nextNode) const;
+        // check if the given src can be cached (by src suppression buffer)
+        bool dpasSrcFootPrintCache(Gen4_Operand_Number opNum, SBNode* curNode, SBNode* nextNode) const;
         bool src2SameFootPrintDiffType(SBNode* curNode, SBNode* nextNode) const;
         bool isLastDpas(SBNode * curNode, SBNode * nextNode);
-
 
         void getLiveOutToken(unsigned allSendNum, const SBNODE_VECT *SBNodes);
 
@@ -1711,6 +1956,7 @@ namespace vISA
         void assignDepToken(SBNode *node);
         void assignDepTokens();
         bool insertSyncTokenPVC(G4_BB * bb, SBNode * node, G4_INST * inst, INST_LIST_ITER inst_it, int newInstID, BitSet * dstTokens, BitSet * srcTokens, bool removeAllToken);
+        bool insertDistSyncPVC(G4_BB* bb, SBNode* node, G4_INST* inst, INST_LIST_ITER inst_it);
         bool insertSyncPVC(G4_BB * bb, SBNode * node, G4_INST * inst, INST_LIST_ITER inst_it, int newInstID, BitSet * dstTokens, BitSet * srcTokens);
         bool insertSyncXe(G4_BB* bb, SBNode* node, G4_INST* inst, INST_LIST_ITER inst_it, int newInstID, BitSet* dstTokens, BitSet* srcTokens);
         void insertSync(G4_BB* bb, SBNode* node, G4_INST* inst, INST_LIST_ITER inst_it, int newInstID, BitSet* dstTokens, BitSet* srcTokens);

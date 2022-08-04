@@ -26,6 +26,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/Analysis/CallGraph.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/CallSite.h"
+#include "llvmWrapper/IR/Instructions.h"
 
 #define DEBUG_TYPE "genx-constantfolding"
 
@@ -55,7 +56,8 @@ bool llvm::canConstantFoldGenXIntrinsic(unsigned IID)
  */
 static Constant *constantFoldRdRegion(Type *RetTy,
                                       ArrayRef<Constant *> Operands,
-                                      const CMRegion &R, const DataLayout &DL) {
+                                      const vc::CMRegion &R,
+                                      const DataLayout &DL) {
   Constant *Input = Operands[GenXIntrinsic::GenXRegion::OldValueOperandNum];
   // The input can be a ConstantExpr if we are being called from
   // CallAnalyzer.
@@ -117,7 +119,8 @@ static Constant *constantFoldRdRegion(Type *RetTy,
  */
 static Constant *constantFoldWrRegion(Type *RetTy,
                                       ArrayRef<Constant *> Operands,
-                                      const CMRegion &R, const DataLayout &DL) {
+                                      const vc::CMRegion &R,
+                                      const DataLayout &DL) {
   Constant *OldValue = Operands[GenXIntrinsic::GenXRegion::OldValueOperandNum];
   Constant *NewValue = Operands[GenXIntrinsic::GenXRegion::NewValueOperandNum];
   Constant *Mask = Operands[GenXIntrinsic::GenXRegion::PredicateOperandNum];
@@ -213,13 +216,13 @@ Constant *llvm::ConstantFoldGenXIntrinsic(unsigned IID, Type *RetTy,
   switch (IID) {
   case GenXIntrinsic::genx_rdregioni:
   case GenXIntrinsic::genx_rdregionf: {
-    CMRegion R(CSInst);
+    vc::CMRegion R(CSInst);
     return constantFoldRdRegion(RetTy, Operands, R, DL);
   }
   // The wrregion case specifically excludes genx_wrconstregion
   case GenXIntrinsic::genx_wrregioni:
   case GenXIntrinsic::genx_wrregionf: {
-    CMRegion R(CSInst);
+    vc::CMRegion R(CSInst);
     return constantFoldWrRegion(RetTy, Operands, R, DL);
   }
   case GenXIntrinsic::genx_all:
@@ -255,7 +258,7 @@ Constant *llvm::ConstantFoldGenX(Instruction *I, const DataLayout &DL) {
     return nullptr;
 
   SmallVector<Constant *, 4> ConstantArgs;
-  ConstantArgs.reserve(CS.getNumArgOperands());
+  ConstantArgs.reserve(IGCLLVM::getNumArgOperands(&CS));
   auto FoldOperand = [&DL](const Use &A) {
     auto *C = cast<Constant>(A.get());
     Constant *Folded = ConstantFoldConstant(C, DL);

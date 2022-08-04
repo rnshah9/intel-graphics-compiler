@@ -258,6 +258,13 @@ public:
         emit(ANSI_RESET);
     }
 
+    void formatInlineBinaryInstruction(const Instruction& i) {
+        emit(".inline_inst ");
+        for (auto val : i.getInlineBinary()) {
+            emitHex(val);
+            emit(" ");
+        }
+    }
 
     // for single instruction
     void formatInstruction(const Instruction& i, const void *vbits) {
@@ -267,6 +274,11 @@ public:
 
     void formatInstruction(const Instruction& i) {
         currInst = &i;
+        if (i.isInlineBinaryInstruction()) {
+            formatInlineBinaryInstruction(i);
+            currInst = nullptr;
+            return;
+        }
 
         if (opts.printInstDeps) {
             formatInstructionDeps(i);
@@ -1138,6 +1150,7 @@ void Formatter::formatSrcOp(
             }
             break;
         case Type::BF8:
+        case Type::HF8:
             emitHex(src.getImmediateValue().u8);
             break;
         case Type::V:
@@ -1471,6 +1484,13 @@ void FormatKernel(
 {
     IGA_ASSERT(k.getModel().platform == opts.model.platform,
         "kernel and options must have same platform");
+    if (opts.printInstDefs && opts.liveAnalysis == nullptr) {
+        DepAnalysis la = ComputeDepAnalysis(&k);
+        FormatOpts optsCopy = opts;
+        optsCopy.liveAnalysis = &la;
+        FormatKernel(e, o, optsCopy, k, bits);
+        return;
+    }
     if (!opts.printJson) {
         Formatter f(e, o, opts);
         f.formatKernel(k, (const uint8_t *)bits);

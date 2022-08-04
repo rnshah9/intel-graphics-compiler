@@ -7,6 +7,7 @@ SPDX-License-Identifier: MIT
 ============================= end_copyright_notice ===========================*/
 
 #include "AdaptorCommon/ImplicitArgs.hpp"
+#include "AdaptorCommon/RayTracing/RTBuilder.h"
 #include "Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/KernelArgs.hpp"
 #include "Compiler/MetaDataUtilsWrapper.h"
@@ -168,9 +169,9 @@ void ModuleAllocaInfo::analyze(Function* F, unsigned& Offset,
 
     // Group by alignment and smallest first.
     auto getAlignment = [=](AllocaInst* AI) -> unsigned {
-        unsigned Alignment = AI->getAlignment();
+        unsigned Alignment = (unsigned)AI->getAlignment();
         if (Alignment == 0)
-            Alignment = DL->getABITypeAlignment(AI->getAllocatedType());
+            Alignment = (unsigned)DL->getABITypeAlignment(AI->getAllocatedType());
         return Alignment;
     };
 
@@ -277,17 +278,27 @@ bool PrivateMemoryResolution::safeToUseScratchSpace(llvm::Module& M) const
 
     //
     // Do not use scratch space if module has any stack call.
-    // Do not use scratch space if modeule has any variable length alloca
+    // Do not use scratch space if module has any variable length alloca
+    // Do not use scratch space if module has indirectly called functions
     //
     if (bOCLLegacyStatelessCheck) {
         if (auto * FGA = getAnalysisIfAvailable<GenXFunctionGroupAnalysis>()) {
             if (FGA->getModule() == &M) {
+                if (FGA->getIndirectCallGroup() != nullptr)
+                    return false;
                 for (auto& I : *FGA) {
                     if (I->hasStackCall())
                         return false;
                     if (I->hasVariableLengthAlloca())
                         return false;
                 }
+            }
+        }
+        else {
+            // Check individual functions if FGA not available
+            for (auto& F : M) {
+                if (F.hasFnAttribute("visaStackCall") || F.hasFnAttribute("hasVLA"))
+                    return false;
             }
         }
     }
@@ -631,6 +642,7 @@ bool PrivateMemoryResolution::runOnModule(llvm::Module& M)
 static void sinkAllocas(SmallVectorImpl<AllocaInst*>& Allocas) {
     IGC_ASSERT(false == Allocas.empty());
     DominatorTree DT;
+    llvm::LoopInfoBase<llvm::BasicBlock, llvm::Loop> LI;
     bool Calcuated = false;
 
     // For each alloca, sink it if it has a use that dominates all other uses.
@@ -661,6 +673,8 @@ static void sinkAllocas(SmallVectorImpl<AllocaInst*>& Allocas) {
         if (!Calcuated) {
             Function* F = AI->getParent()->getParent();
             DT.recalculate(*F);
+            LI.releaseMemory();
+            LI.analyze(DT);
             Calcuated = true;
         }
 
@@ -674,6 +688,13 @@ static void sinkAllocas(SmallVectorImpl<AllocaInst*>& Allocas) {
             if (!DomBB) {
                 break;
             }
+        }
+
+        // Find the nearest Denominator outside loops to prevent multiple allocations
+        BasicBlock* CurBB = AI->getParent();
+        while (DomBB && DomBB != CurBB && LI.getLoopFor(DomBB) != nullptr)
+        {
+            DomBB = DT.getNode(DomBB)->getIDom()->getBlock();
         }
 
         if (DomBB) {
@@ -1068,7 +1089,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
                     }
                 }
             }
-
+            Ctx.metrics.UpdateVariable(pAI, privateBuffer);
             // Replace all uses of original alloca with the bitcast
             pAI->replaceAllUsesWith(privateBuffer);
             pAI->eraseFromParent();
@@ -1128,11 +1149,21 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
             {
                 resultType = IGCLLVM::FixedVectorType::get(resultType, 2);
             }
-            Function* pFunc = GenISAIntrinsic::getDeclaration(
-                m_currFunction->getParent(),
-                GenISAIntrinsic::GenISA_RuntimeValue,
-                resultType);
-            privateBase = entryBuilder.CreateCall(pFunc, entryBuilder.getInt32(modMD->MinNOSPushConstantSize - pointerSizeInDwords));
+            if (Ctx.type == ShaderType::RAYTRACING_SHADER)
+            {
+                RTBuilder rtBuilder(m_currFunction->getContext(), Ctx);
+                rtBuilder.SetInsertPoint(entryBuilder.GetInsertBlock(), entryBuilder.GetInsertPoint());
+                privateBase = rtBuilder.getStatelessScratchPtr();
+                entryBuilder.SetInsertPoint(rtBuilder.GetInsertBlock(), rtBuilder.GetInsertPoint());
+            }
+            else
+            {
+                Function* pFunc = GenISAIntrinsic::getDeclaration(
+                    m_currFunction->getParent(),
+                    GenISAIntrinsic::GenISA_RuntimeValue,
+                    resultType);
+                privateBase = entryBuilder.CreateCall(pFunc, entryBuilder.getInt32(modMD->MinNOSPushConstantSize - pointerSizeInDwords));
+            }
             if (privateBase->getType()->isVectorTy())
             {
                 privateBase = entryBuilder.CreateBitCast(privateBase, entryBuilder.getInt64Ty());
@@ -1203,6 +1234,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
             }
 
             // Replace all uses of original alloca with the bitcast
+            Ctx.metrics.UpdateVariable(pAI, privateBuffer);
             pAI->replaceAllUsesWith(privateBuffer);
             pAI->eraseFromParent();
 
@@ -1210,6 +1242,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
             {
                 // Fix address space in uses of privateBufferPTR, ADDRESS_SPACE_PRIVATE => ADDRESS_SPACE_GLOBAL
                 FixAddressSpaceInAllUses(privateBufferPTR, ADDRESS_SPACE_GLOBAL, ADDRESS_SPACE_PRIVATE);
+                Ctx.metrics.UpdateVariable(privateBuffer, privateBufferPTR);
                 privateBuffer->replaceAllUsesWith(privateBufferPTR);
                 if (Instruction* inst = dyn_cast<Instruction>(privateBuffer))
                 {
@@ -1321,6 +1354,7 @@ bool PrivateMemoryResolution::resolveAllocaInstructions(bool privateOnStack)
         }
 
         // Replace all uses of original alloca with the bitcast
+        Ctx.metrics.UpdateVariable(pAI, privateBuffer);
         pAI->replaceAllUsesWith(privateBuffer);
         pAI->eraseFromParent();
     }

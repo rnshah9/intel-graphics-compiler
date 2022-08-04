@@ -242,6 +242,14 @@ unsigned iga::LastError()
 #endif // _WIN32
 }
 
+static void add_strerror_r_to_error(char *errMsg, int strerror_r_return_value)
+{
+}
+static void add_strerror_r_to_error(char *errMsg, char *strerror_r_return_value)
+{
+  errMsg = strerror_r_return_value;
+}
+
 std::string iga::FormatLastError(unsigned errCode)
 {
     std::string msg;
@@ -259,7 +267,9 @@ std::string iga::FormatLastError(unsigned errCode)
     if (errMsg)
         msg = errMsg;
 #else
-    strerror_r(errCode, buf, sizeof(buf));
+    // Response to issue https://github.com/intel/intel-graphics-compiler/issues/213
+    auto strerror_r_return_value = strerror_r(errCode, buf, sizeof(buf));
+    add_strerror_r_to_error(errMsg, strerror_r_return_value);
 #endif // _WIN32
     if (errMsg == nullptr || errMsg[0] == 0)
         return "???";

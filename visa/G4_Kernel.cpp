@@ -839,6 +839,7 @@ static iga_gen_t getIGAPlatform(TARGET_PLATFORM genPlatform)
     case GENX_TGLLP:platform = IGA_GEN12p1; break;
     case Xe_XeHPSDV: platform = IGA_XE_HP; break;
     case Xe_DG2:
+    case Xe_MTL:
         platform = IGA_XE_HPG;
         break;
     case Xe_PVC:
@@ -1013,17 +1014,40 @@ void G4_Kernel::setKernelParameters()
     // Set the number of GRFs
     if (overrideGRFNum > 0)
     {
-        // User-provided number of GRFs
-        unsigned Val = m_options->getuInt32Option(vISA_GRFNumToUse);
-        if (Val > 0)
-        {
-            numRegTotal = std::min(Val, overrideGRFNum);
-        }
-        else
-        {
-            numRegTotal = overrideGRFNum;
-        }
+        numRegTotal = overrideGRFNum;
         callerSaveLastGRF = ((overrideGRFNum - 8) / 2) - 1;
+    }
+    else if (m_options->getOption(vISA_MultiLevelRegSharing) && overrideNumThreads > 0)
+    {
+        switch (overrideNumThreads)
+        {
+        case 4:
+            numRegTotal = 256;
+            break;
+        case 5:
+            numRegTotal = 192;
+            break;
+        case 6:
+            numRegTotal = 160;
+            break;
+        case 7:
+            numRegTotal = 144;
+            break;
+        case 8:
+            numRegTotal = 128;
+            break;
+        case 9:
+            numRegTotal = 112;
+            break;
+        case 10:
+            numRegTotal = 96;
+            break;
+        case 12:
+            numRegTotal = 80;
+            break;
+        default:
+            numRegTotal = 128;
+        }
     }
     else if (overrideNumThreads > 0)
     {
@@ -1031,6 +1055,7 @@ void G4_Kernel::setKernelParameters()
         {
         case Xe_XeHPSDV:
         case Xe_DG2:
+        case Xe_MTL:
             switch (overrideNumThreads)
             {
             case 4:
@@ -1053,14 +1078,20 @@ void G4_Kernel::setKernelParameters()
             case 6:
                 numRegTotal = 160;
                 break;
+            case 7:
+                numRegTotal = 144;
+                break;
             case 8:
                 numRegTotal = 128;
+                break;
+            case 9:
+                numRegTotal = 112;
                 break;
             case 10:
                 numRegTotal = 96;
                 break;
             case 12:
-                numRegTotal = 64;
+                numRegTotal = 80;
                 break;
             default:
                 numRegTotal = 128;
@@ -1073,9 +1104,7 @@ void G4_Kernel::setKernelParameters()
     }
     else
     {
-        // Default value for all other platforms
-        unsigned Val = m_options->getuInt32Option(vISA_GRFNumToUse);
-        numRegTotal = Val ? Val : 128;
+        numRegTotal = 128;
         callerSaveLastGRF = ((numRegTotal - 8) / 2) - 1;
     }
     // For safety update TotalGRFNum, there may be some uses for this vISA option
@@ -1105,9 +1134,11 @@ void G4_Kernel::setKernelParameters()
             case 6:
                 numSWSBTokens = 20;
                 break;
+            case 7:
             case 8:
                 numSWSBTokens = 16;
                 break;
+            case 9:
             case 10:
                 numSWSBTokens = 12;
                 break;
@@ -1154,6 +1185,7 @@ void G4_Kernel::setKernelParameters()
         {
         case Xe_XeHPSDV:
         case Xe_DG2:
+        case Xe_MTL:
             switch (overrideNumThreads)
             {
             case 4:
@@ -1174,9 +1206,11 @@ void G4_Kernel::setKernelParameters()
                 numAcc = 6;
                 break;
             case 6:
+            case 7:
             case 8:
                 numAcc = 4;
                 break;
+            case 9:
             case 10:
             case 12:
                 numAcc = 2;
@@ -1196,6 +1230,7 @@ void G4_Kernel::setKernelParameters()
         {
         case Xe_XeHPSDV:
         case Xe_DG2:
+        case Xe_MTL:
         case Xe_PVC:
         case Xe_PVCXT:
             numAcc = 4;
@@ -1222,6 +1257,7 @@ void G4_Kernel::setKernelParameters()
             {
             case Xe_XeHPSDV:
             case Xe_DG2:
+            case Xe_MTL:
                 switch (numRegTotal)
                 {
                 case 256:
@@ -1244,12 +1280,19 @@ void G4_Kernel::setKernelParameters()
                 case 160:
                     numThreads = 6;
                     break;
+                case 144:
+                    numThreads = 7;
+                    break;
                 case 128:
                     numThreads = 8;
+                    break;
+                case 112:
+                    numThreads = 9;
                     break;
                 case 96:
                     numThreads = 10;
                     break;
+                case 80:
                 case 64:
                     numThreads = 12;
                     break;
@@ -1611,8 +1654,11 @@ void G4_Kernel::emitDeviceAsmHeaderComment(std::ostream& os)
         os << name;
     }
 
+#if !Release
     os << "\n" << "//.platform " << getGenxPlatformString();
     os << "\n" << "//.thread_config " << "numGRF=" << numRegTotal << ", numAcc=" << numAcc;
+#endif
+
     if (fg.builder->hasSWSB())
     {
         os << ", numSWSB=" << numSWSBTokens;
@@ -1888,8 +1934,9 @@ void G4_Kernel::emitDeviceAsmInstructionsIga(
     assert(errBuf);
     if (!errBuf)
         return;
+    TARGET_PLATFORM p = getPlatform();
     KernelView kv(
-        getIGAPlatform(getPlatform()), binary, binarySize,
+        getIGAPlatform(p), binary, binarySize,
         GetIGASWSBEncodeMode(*fg.builder),
         errBuf, ERROR_STRING_MAX_LENGTH);
     const auto errorMap =
@@ -2045,15 +2092,17 @@ void G4_Kernel::emitDeviceAsmInstructionsIga(
                 os << "// text representation might not be correct";
             }
 
-            static const uint32_t IGA_FMT_OPTS =
-                getOption(vISA_PrintHexFloatInAsm) ? IGA_FORMATTING_OPT_PRINT_HEX_FLOATS : IGA_FORMATTING_OPTS_DEFAULT
+            uint32_t fmtOpts =
+                  IGA_FORMATTING_OPTS_DEFAULT
                 | IGA_FORMATTING_OPT_PRINT_LDST
                 | IGA_FORMATTING_OPT_PRINT_BFNEXPRS;
+            if (getOption(vISA_PrintHexFloatInAsm))
+                fmtOpts |= IGA_FORMATTING_OPT_PRINT_HEX_FLOATS;
             while (true) {
                 size_t nw = kv.getInstSyntax(
                     pc,
                     igaStringBuffer.data(), igaStringBuffer.size(),
-                    IGA_FMT_OPTS,
+                    fmtOpts,
                     labeler, &ls);
                 if (nw == 0) {
                     os << "<<error formatting instruction at PC " << pc << ">>\n";
@@ -2110,9 +2159,9 @@ G4_BB* G4_Kernel::getNextBB(G4_BB* bb) const
         auto curBB = (*it);
         if (curBB == bb)
         {
+            it++;
             if (it != ie)
             {
-                it++;
                 nextBB = (*it);
             }
             break;
@@ -2123,13 +2172,26 @@ G4_BB* G4_Kernel::getNextBB(G4_BB* bb) const
 }
 
 unsigned G4_Kernel::getBinOffsetOfBB(G4_BB* bb) const {
-    if (!bb)
-        return 0;
+    G4_INST* succInst = bb ? bb->getFirstInst() : nullptr;
 
-    // Given a bb, return the binary offset of first non-label of instruction.
-    auto it = std::find_if(bb->begin(), bb->end(), [](G4_INST* inst) { return !inst->isLabel(); });
-    assert(it != bb->end() && "expect at least one non-label inst in second BB");
-    return (unsigned)(*it)->getGenOffset();
+    if (succInst != nullptr) {
+      return (unsigned)succInst->getGenOffset();
+    }
+    else {
+      G4_BB* succBB = bb ? getNextBB(bb) : nullptr;
+
+      while ((succBB != nullptr) && (succInst == nullptr)) {
+        succInst = succBB->getFirstInst();
+        succBB = getNextBB(succBB);
+      }
+
+      if (succInst != nullptr) {
+        return (unsigned)succInst->getGenOffset();
+      }
+      else {
+        return 0;
+      }
+    }
 }
 
 unsigned G4_Kernel::getPerThreadNextOff() const

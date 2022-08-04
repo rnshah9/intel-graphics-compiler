@@ -200,7 +200,7 @@ static unsigned parseNumber(StringRef name, unsigned *offset) {
  * following convention: intel.joint_matrix_acc_8x8_i32_t */
 static void parseMatrixTypeName(const Type *opaqueType, JointMatrixTypeDescription *outDescription) {
     const PointerType *ptrType = cast<PointerType>(opaqueType);
-    StringRef name = ptrType->getElementType()->getStructName();
+    StringRef name = ptrType->getPointerElementType()->getStructName();
 
     unsigned offset = 0;
     if (name.startswith("intel.joint_matrix_packedA_")) {
@@ -436,11 +436,13 @@ static int getSliceSize(const JointMatrixTypeDescription *desc) {
     if (desc->layout == LayoutRowMajor) {
         return desc->rows;
     }
-    if (desc->layout == LayoutPackedA) {
-        return desc->rows * (32 / desc->bitWidth);
-    }
-    if (desc->layout == LayoutPackedB) {
-        return 8  * (32 / desc->bitWidth);
+    if (desc->bitWidth != 0) {
+        if (desc->layout == LayoutPackedA) {
+            return desc->rows * (32 / desc->bitWidth);
+        }
+        if (desc->layout == LayoutPackedB) {
+            return 8 * (32 / desc->bitWidth);
+        }
     }
     IGC_ASSERT_MESSAGE(true, "Unexpected matrix layout.");
     return 1;

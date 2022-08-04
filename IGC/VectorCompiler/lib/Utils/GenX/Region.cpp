@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2018-2021 Intel Corporation
+Copyright (C) 2018-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -25,7 +25,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/Instructions.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/Debug.h"
@@ -33,6 +33,7 @@ SPDX-License-Identifier: MIT
 #include "Probe/Assertion.h"
 
 using namespace llvm;
+using namespace vc;
 
 // Find the datalayout if possible.
 static const DataLayout *getDL(const Value *V) {
@@ -556,13 +557,13 @@ void CMRegion::setRegionCalledFunc(Instruction *Inst)
 {
   auto CI = cast<CallInst>(Inst);
   SmallVector<Value *, 8> Opnds;
-  for (unsigned i = 0, e = CI->getNumArgOperands(); i != e; ++i)
+  for (unsigned i = 0, e = IGCLLVM::getNumArgOperands(CI); i != e; ++i)
     Opnds.push_back(CI->getOperand(i));
   Function *Decl = getGenXRegionDeclaration(
       Inst->getParent()->getParent()->getParent(),
       GenXIntrinsic::getGenXIntrinsicID(Inst),
       Inst->getType(), Opnds);
-  CI->setOperand(CI->getNumArgOperands(), Decl);
+  CI->setOperand(IGCLLVM::getNumArgOperands(CI), Decl);
 }
 
 /***********************************************************************

@@ -12,7 +12,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CodeGenPublic.h"
 #include "common/LLVMWarningsPush.hpp"
 #include <llvmWrapper/IR/IRBuilder.h>
-#include "llvm/IR/Attributes.h"
+#include "llvmWrapper/IR/Attributes.h"
 #include <llvm/IR/Function.h>
 #include <llvmWrapper/IR/Instructions.h>
 #include <llvmWrapper/IR/CallSite.h>
@@ -385,7 +385,7 @@ std::unique_ptr<llvm::Module> BIImport::Construct(Module& M, CLElfLib::CElfReade
                     IGC_ASSERT_MESSAGE(0, "Failed to materialize Global Variables");
                 }
                 else {
-                    pFunc->addAttribute(AttributeList::FunctionIndex, llvm::Attribute::Builtin);
+                    pFunc->addFnAttr(llvm::Attribute::Builtin);
                     Explore(pFunc);
                 }
             }
@@ -542,7 +542,7 @@ bool BIImport::runOnModule(Module& M)
                     IGC_ASSERT_MESSAGE(0, "Failed to materialize Global Variables");
                 }
                 else {
-                    pFunc->addAttribute(AttributeList::FunctionIndex, llvm::Attribute::Builtin);
+                    pFunc->addFnAttr(llvm::Attribute::Builtin);
                     Explore(pFunc);
                 }
             }
@@ -698,8 +698,7 @@ bool BIImport::runOnModule(Module& M)
                 {
                     Function* calledF = dyn_cast<Function>(CI->getArgOperand(0));
                     IGC_ASSERT(calledF && CI->hasFnAttr("vector-variant"));
-                    StringRef VariantName = CI->getAttributes()
-                        .getAttribute(AttributeList::FunctionIndex, "vector-variant")
+                    StringRef VariantName = IGCLLVM::getAttribute(CI->getAttributes(), AttributeList::FunctionIndex, "vector-variant")
                         .getValueAsString();
 
                     // Parse the variant string, and create a function declaration that represents a variant of the called function.
@@ -743,8 +742,7 @@ bool BIImport::runOnModule(Module& M)
                     if (CI->hasFnAttr("vector-variants"))
                     {
                         // Get the list of metadata strings indicating the function variant per index
-                        StringRef VariantsStr = CI->getAttributes()
-                            .getAttribute(AttributeList::FunctionIndex, "vector-variants")
+                        StringRef VariantsStr = IGCLLVM::getAttribute(CI->getAttributes(), AttributeList::FunctionIndex, "vector-variants")
                             .getValueAsString();
                         SmallVector<StringRef, 8> VariantsTable;
                         VariantsStr.split(VariantsTable, ',');
@@ -772,10 +770,10 @@ bool BIImport::runOnModule(Module& M)
                     // Load function address from the table index
                     Value* FP = builder.CreateGEP(FPTablePtr, builder.getInt32(tableIndex));
                     FP = builder.CreateLoad(FP);
-                    IGC_ASSERT(FP->getType()->isPointerTy() && cast<PointerType>(FP->getType())->getElementType()->isFunctionTy());
+                    IGC_ASSERT(FP->getType()->isPointerTy() && cast<PointerType>(FP->getType())->getPointerElementType()->isFunctionTy());
                     // Call the loaded function address
                     SmallVector<Value*, 8> Args;
-                    for (unsigned i = 1; i < CI->getNumArgOperands(); i++)
+                    for (unsigned i = 1; i < IGCLLVM::getNumArgOperands(CI); i++)
                         Args.push_back(CI->getArgOperand(i));
                     CallInst* CallFP = builder.CreateCall(FP, Args);
                     CallFP->setCallingConv(llvm::CallingConv::SPIR_FUNC);
@@ -880,7 +878,7 @@ void BIImport::removeFunctionBitcasts(Module& M)
                                 pDstFunc,
                                 funcTobeChanged,
                                 operandMap,
-                                false,
+                                IGCLLVM::CloneFunctionChangeType::LocalChangesOnly,
                                 Returns,
                                 "");
 
@@ -889,7 +887,7 @@ void BIImport::removeFunctionBitcasts(Module& M)
                         }
 
                         std::vector<Value*> Args;
-                        for (unsigned I = 0, E = pInstCall->getNumArgOperands(); I != E; ++I) {
+                        for (unsigned I = 0, E = IGCLLVM::getNumArgOperands(pInstCall); I != E; ++I) {
                             Args.push_back(pInstCall->getArgOperand(I));
                         }
                         auto newCI = CallInst::Create(pDstFunc, Args, "", pInstCall);
@@ -959,6 +957,7 @@ void BIImport::InitializeBIFlags(Module& M)
     initializeVarWithValue("__HasInt64SLMAtomicCAS", pCtx->platform.hasInt64SLMAtomicCAS() ? 1 : 0);
     initializeVarWithValue("__UseNativeFP64GlobalAtomicAdd", pCtx->platform.hasFP64GlobalAtomicAdd() ? 1 : 0);
     initializeVarWithValue("__UseNative64BitIntBuiltin", pCtx->platform.hasNoFullI64Support() ? 0 : 1);
+    initializeVarWithValue("__HasThreadPauseSupport", pCtx->platform.hasThreadPauseSupport() ? 1 : 0);
     initializeVarWithValue("__UseNative64BitFloatBuiltin", pCtx->platform.hasNoFP64Inst() ? 0 : 1);
     initializeVarWithValue("__CRMacros",
         pCtx->platform.hasCorrectlyRoundedMacros() ? 1 : 0);
@@ -1175,7 +1174,8 @@ bool PreBIImportAnalysis::runOnModule(Module& M)
                 isCandidate = true;
               }
 
-              if (isCandidate && fmulInst->getNumUses() > 1) {
+              // used to be: fmulInst->getNumUses() > 1
+              if (isCandidate && fmulInst->hasNUsesOrMore(2)) {
                 Value::use_iterator fmulUse = fmulInst->use_begin();
                 Value::use_iterator fmulUseEnd = fmulInst->use_end();
 
@@ -1228,7 +1228,7 @@ bool PreBIImportAnalysis::runOnModule(Module& M)
 
                   if (Function *newFunc = M.getFunction(newName)) {
                     SmallVector<Value *, 8> Args;
-                    for (unsigned I = 0, E = CI->getNumArgOperands(); I != E;
+                    for (unsigned I = 0, E = IGCLLVM::getNumArgOperands(CI); I != E;
                          ++I) {
                       Args.push_back(CI->getArgOperand(I));
                     }

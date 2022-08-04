@@ -18,7 +18,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
-#include "llvm/IR/Instructions.h"
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -124,16 +124,16 @@ namespace {
         void setExpandedValues(Value* V, Value* Lo, Value* Hi);
 
         unsigned getAlignment(LoadInst* LD) const {
-            unsigned Align = LD->getAlignment();
+            unsigned Align = (unsigned)LD->getAlignment();
             if (Align == 0)
-                Align = DL->getABITypeAlignment(LD->getType());
+                Align = (unsigned)DL->getABITypeAlignment(LD->getType());
             return Align;
         }
 
         unsigned getAlignment(StoreInst* ST) const {
-            unsigned Align = ST->getAlignment();
+            unsigned Align = (unsigned)ST->getAlignment();
             if (Align == 0)
-                Align = DL->getABITypeAlignment(ST->getType());
+                Align = (unsigned)DL->getABITypeAlignment(ST->getType());
             return Align;
         }
 
@@ -216,6 +216,7 @@ namespace {
         bool visitSRem(BinaryOperator&);
         bool visitURem(BinaryOperator&);
         bool visitFRem(BinaryOperator&) { return false; }
+        bool visitFNeg(UnaryOperator&) { return false; }
 
         bool visitShl(BinaryOperator&);
         bool visitLShr(BinaryOperator&);
@@ -1911,6 +1912,8 @@ bool InstExpander::visitCall(CallInst& Call) {
         OutputHi = IRB->CreateExtractElement(V, IRB->getInt32(1));
     };
 
+    IGC_ASSERT(nullptr != Emu);
+
     const Function* F = Call.getCalledFunction();
     if (F && F->isDeclaration()) {
         switch (F->getIntrinsicID()) {
@@ -1929,9 +1932,32 @@ bool InstExpander::visitCall(CallInst& Call) {
         case Intrinsic::invariant_start:
         case Intrinsic::invariant_end:
             return false;
+#if LLVM_VERSION_MAJOR >= 12
+        // emulate @llvm.abs.i64
+        case Intrinsic::abs:
+        {
+            Value* OldVal = Call.getArgOperand(0);
+            Value* Lo = nullptr, * Hi = nullptr;
+            std::tie(Lo, Hi) = Emu->getExpandedValues(OldVal);
+
+            Value* Cmp = IRB->CreateICmpSLT(Hi, IRB->getInt32(0));
+
+            GenISAIntrinsic::ID GIID = GenISAIntrinsic::GenISA_sub_pair;
+            Function* IFunc = GenISAIntrinsic::getDeclaration(Emu->getModule(), GIID);
+            Value* Sub = IRB->CreateCall4(IFunc, IRB->getInt32(0), IRB->getInt32(0), Lo, Hi);
+
+            Value* SubLo = IRB->CreateExtractValue(Sub, 0);
+            Value* SubHi = IRB->CreateExtractValue(Sub, 1);
+
+            Value* SelectLo = IRB->CreateSelect(Cmp, SubLo, Lo);
+            Value* SelectHo = IRB->CreateSelect(Cmp, SubHi, Hi);
+
+            Emu->setExpandedValues(&Call, SelectLo, SelectHo);
+            return true;
+        }
+#endif
         }
     }
-    IGC_ASSERT(nullptr != Emu);
     bool doInt64BitCall = Emu->isInt64(&Call);
     if (!doInt64BitCall) {
         for (auto& Op : Call.operands()) {
@@ -1950,7 +1976,7 @@ bool InstExpander::visitCall(CallInst& Call) {
     IGC_ASSERT(nullptr != CallCopy);
     CallCopy->insertBefore(&Call);
     IRB->SetInsertPoint(CallCopy);
-    for (int argNo=0, sz = (int)Call.getNumArgOperands(); argNo < sz; ++argNo)
+    for (int argNo=0, sz = (int)IGCLLVM::getNumArgOperands(&Call); argNo < sz; ++argNo)
     {
         Value* OldVal = Call.getArgOperand(argNo);
         if (Emu->isInt64(OldVal))

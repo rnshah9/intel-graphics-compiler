@@ -35,8 +35,6 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "GENX_PROLOGUE"
-
 #include "GenX.h"
 #include "GenXIntrinsics.h"
 #include "GenXModule.h"
@@ -68,6 +66,8 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/InstrTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
+
+#define DEBUG_TYPE "GENX_PROLOGUE"
 
 #include <unordered_set>
 
@@ -401,9 +401,9 @@ void GenXPrologEpilogInsertion::removeAttrs(Function &F) const {
 }
 
 static void removeCallInstAttrs(CallInst &CI) {
-  CI.removeAttribute(AttributeList::FunctionIndex, Attribute::ReadNone);
-  CI.removeAttribute(AttributeList::FunctionIndex, Attribute::ReadOnly);
-  CI.removeAttribute(AttributeList::FunctionIndex, Attribute::WriteOnly);
+  IGCLLVM::removeFnAttr(&CI, Attribute::ReadNone);
+  IGCLLVM::removeFnAttr(&CI, Attribute::ReadOnly);
+  IGCLLVM::removeFnAttr(&CI, Attribute::WriteOnly);
 }
 
 bool GenXPrologEpilogInsertion::runOnFunction(Function &F) {

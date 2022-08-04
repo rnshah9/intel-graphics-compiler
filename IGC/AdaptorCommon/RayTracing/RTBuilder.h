@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2019-2021 Intel Corporation
+Copyright (C) 2019-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -43,6 +43,7 @@ public:
     static constexpr char *MergeFuncName = "__mergeContinuation";
     static constexpr char *BTDTarget = "btd.target";
     static constexpr char* SpillSize = "spill.size";
+    static constexpr char* IsContinuation = "is.continuation";
     enum RTMemoryAccessMode
     {
         STATELESS,
@@ -61,7 +62,6 @@ private:
 
     uint32_t NumDSSPerSlice            = 0;
     uint32_t EuCountPerDSS             = 0;
-    uint32_t ThreadCountPerEU          = 0;
     uint32_t MaxDualSubSlicesSupported = 0;
 
     //TODO: this is hardcoded string, we might want to put all "printf" of different adaptors to one place eventually
@@ -197,9 +197,6 @@ private:
                 }
             }
         }
-
-        ThreadCountPerEU = SysInfo.ThreadCount / SysInfo.EUCount;
-
         DisableRTGlobalsKnownValues = IGC_IS_FLAG_ENABLED(DisableRTGlobalsKnownValues);
     }
 
@@ -356,6 +353,7 @@ public:
     Value* getpHitGroupBasePtr(void);
     Value* getMissShaderBasePtr(void);
     Value* getpMissShaderBasePtr(void);
+    Value* getStatelessScratchPtr(void);
     Value* getCallableShaderBasePtr(void);
     Value* getpCallableShaderBasePtr(void);
     Value* getBindlessHeapBasePtr(void);
@@ -538,10 +536,14 @@ public:
         Type* PayloadTy,
         ContinuationHLIntrinsic* intrin,
         SWStackPtrVal* StackFrameVal);
-    void storePayload(
+    SmallVector<StoreInst*, 2> storePayload(
         IGC::TraceRayRTArgs &Args,
         Value* Payload,
         SWStackPtrVal* StackFrameVal);
+
+    Value* computeReturnIP(
+        const IGC::RayDispatchShaderContext& RayCtx,
+        Function &F);
 
     CallInst* CreateLSCFence(LSC_SFID SFID, LSC_SCOPE Scope, LSC_FENCE_OP FenceOp);
 public:
@@ -629,7 +631,8 @@ public:
     Value* getProceduralHitKind(
         IGC::RTArgs &Args,
         SWStackPtrVal* FrameAddr);
-    PayloadPtrIntrinsic* getPayloadPtrIntrinsic(Value* PayloadPtr);
+    PayloadPtrIntrinsic* getPayloadPtrIntrinsic(
+        Value* PayloadPtr, SWStackPtrVal* FrameAddr);
     ContinuationSignpostIntrinsic* getContinuationSignpost(Value* FrameAddr, Value* Offset);
 
     SpillValueIntrinsic* getSpillValue(Value* Val, uint64_t Offset);
@@ -641,6 +644,10 @@ public:
     static void setSpillSize(ContinuationHLIntrinsic& CI, uint32_t SpillSize);
     static Optional<uint32_t> getSpillSize(
         const ContinuationHLIntrinsic& CI);
+    static void markAsContinuation(Function& F);
+    static bool isContinuation(const Function& F);
+
+    GetShaderRecordPtrIntrinsic* getShaderRecordPtr(Function* F);
 public:
     static Instruction* getEntryFirstInsertionPt(
         Function &F,

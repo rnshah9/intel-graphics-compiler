@@ -6,7 +6,6 @@ SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
-#define DEBUG_TYPE "gas-resolver"
 #include "Compiler/CISACodeGen/ResolveGAS.h"
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
 #include "Compiler/CISACodeGen/CastToGASAnalysis.h"
@@ -33,6 +32,8 @@ SPDX-License-Identifier: MIT
 #include "GenISAIntrinsics/GenIntrinsics.h"
 #include "Probe/Assertion.h"
 #include <llvm/IR/PatternMatch.h>
+
+#define DEBUG_TYPE "gas-resolver"
 
 using namespace llvm;
 using namespace IGC;
@@ -88,7 +89,7 @@ namespace {
         friend class InstVisitor<GASPropagator, bool>;
 
         LoopInfo* const LI;
-        BuilderType* const IRB;
+        BuilderType IRB;
 
         Use* TheUse;
         Value* TheVal;
@@ -97,8 +98,8 @@ namespace {
         DenseSet<PHINode*> ResolvableLoopPHIs;
 
     public:
-        GASPropagator(BuilderType* Builder, LoopInfo* LoopInfo)
-            : IRB(Builder), LI(LoopInfo), TheUse(nullptr), TheVal(nullptr) {
+        GASPropagator(LLVMContext& Ctx, LoopInfo* LoopInfo)
+            : IRB(Ctx), LI(LoopInfo), TheUse(nullptr), TheVal(nullptr) {
             populateResolvableLoopPHIs();
         }
 
@@ -195,9 +196,10 @@ namespace IGC {
 }
 
 bool GASResolving::runOnFunction(Function& F) {
-    BuilderType TheBuilder(F.getContext());
+    LLVMContext& Ctx = F.getContext();
     LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-    GASPropagator ThePropagator(&TheBuilder, &LI);
+    BuilderType TheBuilder(Ctx);
+    GASPropagator ThePropagator(Ctx, &LI);
     IRB = &TheBuilder;
     Propagator = &ThePropagator;
     bool Changed = false;
@@ -384,10 +386,10 @@ bool GASPropagator::visitAddrSpaceCastInst(AddrSpaceCastInst& I) {
         return false;
 
     Value* Src = TheVal;
-    if (SrcPtrTy->getElementType() != DstPtrTy->getElementType()) {
-        BuilderType::InsertPointGuard Guard(*IRB);
-        IRB->SetInsertPoint(&I);
-        Src = IRB->CreateBitCast(Src, DstPtrTy);
+    if (SrcPtrTy->getPointerElementType() != DstPtrTy->getPointerElementType()) {
+        BuilderType::InsertPointGuard Guard(IRB);
+        IRB.SetInsertPoint(&I);
+        Src = IRB.CreateBitCast(Src, DstPtrTy);
     }
     I.replaceAllUsesWith(Src);
     I.eraseFromParent();
@@ -399,17 +401,17 @@ bool GASPropagator::visitBitCastInst(BitCastInst& I) {
     PointerType* SrcPtrTy = cast<PointerType>(TheVal->getType());
     PointerType* DstPtrTy = cast<PointerType>(I.getType());
 
-    BuilderType::InsertPointGuard Guard(*IRB);
-    IRB->SetInsertPoint(&(*std::next(BasicBlock::iterator(&I))));
+    BuilderType::InsertPointGuard Guard(IRB);
+    IRB.SetInsertPoint(I.getNextNode());
     // Push `addrspacecast` forward by replacing this `bitcast` on GAS with the
     // one on non-GAS followed by a new `addrspacecast` to GAS.
-    Type* DstTy = DstPtrTy->getElementType();
+    Type* DstTy = DstPtrTy->getPointerElementType();
     PointerType* TransPtrTy =
         PointerType::get(DstTy, SrcPtrTy->getAddressSpace());
     Value* Src = TheVal;
-    if (SrcPtrTy->getElementType() != DstTy)
-        Src = IRB->CreateBitCast(Src, TransPtrTy);
-    Value* NewPtr = IRB->CreateAddrSpaceCast(Src, DstPtrTy);
+    if (SrcPtrTy->getPointerElementType() != DstTy)
+        Src = IRB.CreateBitCast(Src, TransPtrTy);
+    Value* NewPtr = IRB.CreateAddrSpaceCast(Src, DstPtrTy);
     I.replaceAllUsesWith(NewPtr);
     I.eraseFromParent();
 
@@ -426,16 +428,16 @@ bool GASPropagator::visitGetElementPtrInst(GetElementPtrInst& I) {
     PointerType* SrcPtrTy = cast<PointerType>(TheVal->getType());
     PointerType* DstPtrTy = cast<PointerType>(I.getType());
 
-    BuilderType::InsertPointGuard Guard(*IRB);
-    IRB->SetInsertPoint(&(*std::next(BasicBlock::iterator(&I))));
+    BuilderType::InsertPointGuard Guard(IRB);
+    IRB.SetInsertPoint(I.getNextNode());
     // Push `getelementptr` forward by replacing this `bitcast` on GAS with the
     // one on non-GAS followed by a new `addrspacecast` to GAS.
-    Type* DstTy = DstPtrTy->getElementType();
+    Type* DstTy = DstPtrTy->getPointerElementType();
     PointerType* TransPtrTy =
         PointerType::get(DstTy, SrcPtrTy->getAddressSpace());
     TheUse->set(TheVal);
     I.mutateType(TransPtrTy);
-    Value* NewPtr = IRB->CreateAddrSpaceCast(&I, DstPtrTy);
+    Value* NewPtr = IRB.CreateAddrSpaceCast(&I, DstPtrTy);
     for (auto UI = I.use_begin(), UE = I.use_end(); UI != UE; /*EMPTY*/) {
         Use& U = *UI++;
         if (U.getUser() == NewPtr)
@@ -463,10 +465,10 @@ bool GASPropagator::visitPHINode(PHINode& PN) {
             }
             Instruction* I = cast<Instruction>(V);
             // For value generated inside loop, cast them to non-GAS pointers.
-            BuilderType::InsertPointGuard Guard(*IRB);
-            IRB->SetInsertPoint(&(*std::next(BasicBlock::iterator(I))));
+            BuilderType::InsertPointGuard Guard(IRB);
+            IRB.SetInsertPoint(I->getNextNode());
 
-            NewIncomingValues[i] = IRB->CreateAddrSpaceCast(I, NonGASTy);
+            NewIncomingValues[i] = IRB.CreateAddrSpaceCast(I, NonGASTy);
         }
     }
     else {
@@ -501,9 +503,9 @@ bool GASPropagator::visitPHINode(PHINode& PN) {
     NewPN->takeName(&PN);
     NewPN->setDebugLoc(PN.getDebugLoc());
 
-    BuilderType::InsertPointGuard Guard(*IRB);
-    IRB->SetInsertPoint(PN.getParent()->getFirstNonPHI());
-    Value* NewPtr = IRB->CreateAddrSpaceCast(NewPN, GASTy);
+    BuilderType::InsertPointGuard Guard(IRB);
+    IRB.SetInsertPoint(PN.getParent()->getFirstNonPHI());
+    Value* NewPtr = IRB.CreateAddrSpaceCast(NewPN, GASTy);
     PN.replaceAllUsesWith(NewPtr);
     PN.eraseFromParent();
     return true;
@@ -547,17 +549,17 @@ bool GASPropagator::visitSelect(SelectInst& I) {
     TheOtherUse->set(TheOtherVal);
 
     // Handle select return type
-    BuilderType::InsertPointGuard Guard(*IRB);
-    IRB->SetInsertPoint(&(*std::next(BasicBlock::iterator(&I))));
+    BuilderType::InsertPointGuard Guard(IRB);
+    IRB.SetInsertPoint(I.getNextNode());
 
     PointerType* DstPtrTy = cast<PointerType>(I.getType());
     PointerType* NonGASPtrTy = dyn_cast<PointerType>(NonGASTy);
 
     // Push 'addrspacecast' forward by changing the select return type to non-GAS pointer
     // followed by a new 'addrspacecast' to GAS
-    PointerType* TransPtrTy = PointerType::get(DstPtrTy->getElementType(), NonGASPtrTy->getAddressSpace());
+    PointerType* TransPtrTy = PointerType::get(DstPtrTy->getPointerElementType(), NonGASPtrTy->getAddressSpace());
     I.mutateType(TransPtrTy);
-    Value* NewPtr = IRB->CreateAddrSpaceCast(&I, DstPtrTy);
+    Value* NewPtr = IRB.CreateAddrSpaceCast(&I, DstPtrTy);
 
     for (auto UI = I.use_begin(), UE = I.use_end(); UI != UE;) {
         Use& U = *UI++;
@@ -701,9 +703,9 @@ bool GASPropagator::visitCallInst(CallInst& I) {
         Type* DstTy = I.getType();
         Value* NewPtr = Constant::getNullValue(DstTy);
         if (SrcPtrTy->getAddressSpace() == ADDRESS_SPACE_LOCAL) {
-            BuilderType::InsertPointGuard Guard(*IRB);
-            IRB->SetInsertPoint(&I);
-            NewPtr = IRB->CreateBitCast(TheVal, DstTy);
+            BuilderType::InsertPointGuard Guard(IRB);
+            IRB.SetInsertPoint(&I);
+            NewPtr = IRB.CreateBitCast(TheVal, DstTy);
         }
         I.replaceAllUsesWith(NewPtr);
         I.eraseFromParent();
@@ -715,9 +717,9 @@ bool GASPropagator::visitCallInst(CallInst& I) {
         Type* DstTy = I.getType();
         Value* NewPtr = Constant::getNullValue(DstTy);
         if (SrcPtrTy->getAddressSpace() == ADDRESS_SPACE_PRIVATE) {
-            BuilderType::InsertPointGuard Guard(*IRB);
-            IRB->SetInsertPoint(&I);
-            NewPtr = IRB->CreateBitCast(TheVal, DstTy);
+            BuilderType::InsertPointGuard Guard(IRB);
+            IRB.SetInsertPoint(&I);
+            NewPtr = IRB.CreateBitCast(TheVal, DstTy);
         }
         I.replaceAllUsesWith(NewPtr);
         I.eraseFromParent();
@@ -881,7 +883,7 @@ void GASResolving::convertLoadToGlobal(LoadInst* LI) const {
 
     PointerType* PtrTy = cast<PointerType>(LI->getType());
     IRB->SetInsertPoint(LI->getNextNode());
-    PointerType* GlobalPtrTy = PointerType::get(PtrTy->getElementType(), ADDRESS_SPACE_GLOBAL);
+    PointerType* GlobalPtrTy = PointerType::get(PtrTy->getPointerElementType(), ADDRESS_SPACE_GLOBAL);
     Value* GlobalAddr = IRB->CreateAddrSpaceCast(LI, GlobalPtrTy);
     Value* GenericCopyAddr = IRB->CreateAddrSpaceCast(GlobalAddr, PtrTy);
 
@@ -902,7 +904,7 @@ bool GASResolving::checkGenericArguments(Function& F) const {
         if (auto Ty = dyn_cast<PointerType>(FT->getParamType(p))) {
             if (Ty->getAddressSpace() != ADDRESS_SPACE_GLOBAL)
                 continue;
-            auto PteeTy = Ty->getElementType();
+            auto PteeTy = Ty->getPointerElementType();
             if (auto PTy = dyn_cast<PointerType>(PteeTy)) {
                 if (PTy->getAddressSpace() == ADDRESS_SPACE_GENERIC)
                     return true;
@@ -951,9 +953,8 @@ bool GASRetValuePropagator::runOnModule(Module& M) {
 
     for (auto* F : candidates)
     {
-        BuilderType TheBuilder(F->getContext());
         LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
-        GASPropagator ThePropagator(&TheBuilder, &LI);
+        GASPropagator ThePropagator(F->getContext(), &LI);
         m_Propagator = &ThePropagator;
 
         if (propagateReturnValue(F))
@@ -1127,7 +1128,7 @@ void GASRetValuePropagator::updateAllUsesWithNewFunction(Function* oldFunc, Func
 
         // Prepare args for new call
         std::vector<Value*> callArgs;
-        for (unsigned I = 0, E = cInst->getNumArgOperands(); I != E; ++I) {
+        for (unsigned I = 0, E = IGCLLVM::getNumArgOperands(cInst); I != E; ++I) {
             callArgs.push_back(cInst->getArgOperand(I));
         }
 
@@ -1268,6 +1269,126 @@ void GASRetValuePropagator::updateMetadata(Function* oldFunc, Function* newFunc)
 
 namespace IGC
 {
+    class StaticGASResolution : public FunctionPass
+    {
+    public:
+        static char ID;
+
+        StaticGASResolution() : FunctionPass(ID)
+        {
+            initializeStaticGASResolutionPass(*PassRegistry::getPassRegistry());
+        }
+
+        bool runOnFunction(Function&) override;
+
+        virtual void getAnalysisUsage(llvm::AnalysisUsage& AU) const override
+        {
+            AU.addRequired<CodeGenContextWrapper>();
+            AU.addRequired<CastToGASWrapperPass>();
+        }
+
+        virtual StringRef getPassName() const override
+        {
+            return "StaticGASResolution";
+        }
+    private:
+        GASInfo* m_GI = nullptr;
+    };
+} // End anonymous namespace
+
+FunctionPass* IGC::createStaticGASResolution() { return new StaticGASResolution(); }
+
+char StaticGASResolution::ID = 0;
+
+#define SGR_PASS_FLAG "static-gas-resolution"
+#define SGR_PASS_DESC "Statically resolves memory accesses operating on generic pointers"
+#define SGR_PASS_CFG_ONLY false
+#define SGR_PASS_ANALYSIS false
+namespace IGC
+{
+    IGC_INITIALIZE_PASS_BEGIN(StaticGASResolution, SGR_PASS_FLAG, SGR_PASS_DESC, SGR_PASS_CFG_ONLY, SGR_PASS_ANALYSIS)
+    IGC_INITIALIZE_PASS_DEPENDENCY(CodeGenContextWrapper)
+    IGC_INITIALIZE_PASS_DEPENDENCY(CastToGASWrapperPass)
+    IGC_INITIALIZE_PASS_END(StaticGASResolution, SGR_PASS_FLAG, SGR_PASS_DESC, SGR_PASS_CFG_ONLY, SGR_PASS_ANALYSIS)
+}
+
+bool StaticGASResolution::runOnFunction(llvm::Function& F)
+{
+    m_GI = &getAnalysis<CastToGASWrapperPass>().getGASInfo();
+    // Change GAS inst, such as ld/st, etc to global ld/st, etc.
+    if (m_GI->canGenericPointToPrivate(F) || m_GI->canGenericPointToLocal(F))
+        return false;
+
+    CodeGenContext* ctx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
+    // As AddrSpaceCast has been processed already in GASResolving,
+    // here only handle non-addrspacecast ptr
+    auto toSkip = [](Value* P) {
+        if (PointerType* PtrTy = dyn_cast<PointerType>(P->getType()))
+        {
+            if (PtrTy->getAddressSpace() == ADDRESS_SPACE_GENERIC && !isa<AddrSpaceCastInst>(P))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    IRBuilder<> IRB(F.getContext());
+    bool changed = false;
+    auto NI = inst_begin(F);
+    for (auto FI = NI, FE = inst_end(F); FI != FE; FI = NI)
+    {
+        ++NI;
+
+        Instruction* I = &(*FI);
+        LoadInst* LI = dyn_cast<LoadInst>(I);
+        StoreInst* SI = dyn_cast<StoreInst>(I);
+        if (LI || SI)
+        {
+            Value* Ptr = LI ? LI->getPointerOperand() : SI->getPointerOperand();
+            if (!toSkip(Ptr))
+            {
+                PointerType* PtrTy = cast<PointerType>(Ptr->getType());
+                Type* eltTy = PtrTy->getPointerElementType();
+                PointerType* glbPtrTy = PointerType::get(eltTy, ADDRESS_SPACE_GLOBAL);
+
+                IRB.SetInsertPoint(I);
+                Value* NewPtr = IRB.CreateAddrSpaceCast(Ptr, glbPtrTy);
+                I->setOperand(LI ? 0 : 1, NewPtr);
+                if (Instruction* tI = dyn_cast<Instruction>(NewPtr))
+                {
+                    tI->setDebugLoc(I->getDebugLoc());
+                }
+
+                changed = true;
+            }
+        }
+    }
+
+    if (changed)
+    {
+        // Above optimization changes an addrspace of load and store instructions
+        // operating on a generic pointer. One of the cases when optimization may
+        // be applied is when private memory is allocated in a global buffer. Together
+        // with an information that local pointers are not casted to generic addrspace,
+        // compiler is assured that all generic pointers point to a global memory.
+        // If the optimization happens, usage of generic pointer in any load and store
+        // instructions disappear.
+        //
+        // m_mustAllocatePrivateAsGlobalBuffer variable is necessary to point out that
+        // above optimization has been applied. Since PrivateMemoryResolution pass
+        // allocates private memory in a global buffer only if there is any load or
+        // store operating on a generic addrspace, the above optimization could mislead
+        // the logic in PrivateMemoryResolution causing private memory not being
+        // allocated in a global buffer.
+        ctx->m_mustAllocatePrivateAsGlobalBuffer = true;
+    }
+
+    return changed;
+}
+
+namespace IGC
+{
     //
     // (1)
     // Optimization pass to lower generic pointers in function arguments.
@@ -1309,7 +1430,6 @@ namespace IGC
             AU.addRequired<MetaDataUtilsWrapper>();
             AU.addRequired<CallGraphWrapperPass>();
             AU.addRequired<LoopInfoWrapperPass>();
-            AU.addRequired<CastToGASWrapperPass>();
         }
 
         virtual StringRef getPassName() const override
@@ -1331,11 +1451,6 @@ namespace IGC
         IGCMD::MetaDataUtils* m_mdUtils = nullptr;
         CodeGenContext* m_ctx = nullptr;
         Module* m_module = nullptr;
-        GASInfo* m_GI = nullptr;
-        bool m_changed = false;
-
-        void processCallArg(Module& M);
-        void processGASInst(Module& M);
 
         std::optional<unsigned> getOriginAddressSpace(Function* func, unsigned argNo);
         void updateFunctionArgs(Function* oldFunc, Function* newFunc);
@@ -1361,7 +1476,6 @@ namespace IGC
     IGC_INITIALIZE_PASS_DEPENDENCY(MetaDataUtilsWrapper)
     IGC_INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
     IGC_INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
-    IGC_INITIALIZE_PASS_DEPENDENCY(CastToGASWrapperPass)
     IGC_INITIALIZE_PASS_END(LowerGPCallArg, GP_PASS_FLAG, GP_PASS_DESC, GP_PASS_CFG_ONLY, GP_PASS_ANALYSIS)
 }
 
@@ -1369,22 +1483,11 @@ bool LowerGPCallArg::runOnModule(llvm::Module& M)
 {
     m_ctx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
     m_mdUtils = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
-    m_GI = &getAnalysis<CastToGASWrapperPass>().getGASInfo();
     m_module = &M;
 
-    // (1) main work
-    processCallArg(M);
-
-    // (2) further static resolution
-    processGASInst(M);
-
-    return m_changed;
-}
-
-void LowerGPCallArg::processCallArg(Module& M)
-{
     CallGraph& CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
     std::vector<Function*> candidates = findCandidates(CG);
+    bool changed = false;
     for (auto F : reverse(candidates))
     {
         GenericPointerArgs genericArgsInfo;
@@ -1397,7 +1500,7 @@ void LowerGPCallArg::processCallArg(Module& M)
             if (argTy->isPointerTy() && argTy->getPointerAddressSpace() == ADDRESS_SPACE_GENERIC)
             {
                 if (auto originAddrSpace = getOriginAddressSpace(F, arg.getArgNo()))
-                    genericArgsInfo.push_back({ arg.getArgNo(), originAddrSpace.value()});
+                    genericArgsInfo.push_back({ arg.getArgNo(), originAddrSpace.value() });
             }
         }
 
@@ -1410,78 +1513,10 @@ void LowerGPCallArg::processCallArg(Module& M)
         updateMetadata(F, newFunc);
 
         F->eraseFromParent();
-        m_changed = true;
+        changed = true;
     }
-}
 
-void LowerGPCallArg::processGASInst(Module& M)
-{
-    // As AddrSpaceCast has been processed already in GASResolving,
-    // here only handle non-addrspacecast ptr
-    auto toSkip = [](Value* P) {
-        if (PointerType* PtrTy = dyn_cast<PointerType>(P->getType()))
-        {
-            if (PtrTy->getAddressSpace() == ADDRESS_SPACE_GENERIC && !isa<AddrSpaceCastInst>(P))
-            {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    IRBuilder<> IRB(M.getContext());
-    // Change GAS inst, such as ld/st, etc to global ld/st, etc.
-    for (Function& F : M)
-    {
-        if (m_GI->canGenericPointToPrivate(F) || m_GI->canGenericPointToLocal(F))
-            continue;
-
-        auto NI = inst_begin(F);
-        for (auto FI = NI, FE = inst_end(F); FI != FE; FI = NI)
-        {
-            ++NI;
-
-            Instruction* I = &(*FI);
-            LoadInst* LI = dyn_cast<LoadInst>(I);
-            StoreInst* SI = dyn_cast<StoreInst>(I);
-            if (LI || SI)
-            {
-                Value* Ptr = LI ? LI->getPointerOperand() : SI->getPointerOperand();
-                if (!toSkip(Ptr))
-                {
-                    PointerType* PtrTy = cast<PointerType>(Ptr->getType());
-                    Type* eltTy = PtrTy->getPointerElementType();
-                    PointerType* glbPtrTy = PointerType::get(eltTy, ADDRESS_SPACE_GLOBAL);
-
-                    IRB.SetInsertPoint(I);
-                    Value* NewPtr = IRB.CreateAddrSpaceCast(Ptr, glbPtrTy);
-                    I->setOperand(LI ? 0 : 1, NewPtr);
-                    if (Instruction* tI = dyn_cast<Instruction>(NewPtr))
-                    {
-                        tI->setDebugLoc(I->getDebugLoc());
-                    }
-
-                    m_changed = true;
-                }
-            }
-            else if (CallInst* CallI = dyn_cast<CallInst>(I))
-            {
-                Function* Callee = CallI->getCalledFunction();
-                if (Callee &&
-                    (Callee->getName().equals("__builtin_IB_to_local") ||
-                     Callee->getName().equals("__builtin_IB_to_private")) &&
-                    !toSkip(CallI->getOperand(0)))
-                {
-                    Type* DstTy = I->getType();
-                    Value* NewPtr = Constant::getNullValue(DstTy);
-                    I->replaceAllUsesWith(NewPtr);
-                    I->eraseFromParent();
-
-                    m_changed = true;
-                }
-            }
-        }
-    }
+    return changed;
 }
 
 std::vector<Function*> LowerGPCallArg::findCandidates(CallGraph& CG)
@@ -1597,7 +1632,6 @@ std::optional<unsigned> LowerGPCallArg::getOriginAddressSpace(Function* func, un
 // Loops over the argument list transferring uses from old function to new one.
 void LowerGPCallArg::updateFunctionArgs(Function* oldFunc, Function* newFunc)
 {
-    BuilderType TheBuilder(newFunc->getEntryBlock().getFirstNonPHI());
     for (auto ArgPair : llvm::zip(oldFunc->args(), newFunc->args()))
     {
         Value* oldArg = &std::get<0>(ArgPair);
@@ -1611,11 +1645,12 @@ void LowerGPCallArg::updateFunctionArgs(Function* oldFunc, Function* newFunc)
             continue;
         }
 
-        auto* NewArgToGeneric = TheBuilder.CreateAddrSpaceCast(newArg, oldArg->getType(), "");
+        auto* NewArgToGeneric = CastInst::Create(
+            Instruction::AddrSpaceCast, newArg, oldArg->getType(), "", newFunc->getEntryBlock().getFirstNonPHI());
         oldArg->replaceAllUsesWith(NewArgToGeneric);
 
         LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>(*newFunc).getLoopInfo();
-        GASPropagator Propagator(&TheBuilder, &LI);
+        GASPropagator Propagator(newFunc->getContext(), &LI);
         Propagator.propagate(newArg);
     }
 }
@@ -1689,7 +1724,7 @@ void LowerGPCallArg::updateAllUsesWithNewFunction(Function* oldFunc, Function* n
         std::vector<Value*> newCallArgs;
 
         auto AI = newFunc->arg_begin();
-        for (unsigned int i = 0; i < cInst->getNumArgOperands(); ++i, ++AI)
+        for (unsigned int i = 0; i < IGCLLVM::getNumArgOperands(cInst); ++i, ++AI)
         {
             Value* callArg = cInst->getOperand(i);
             Value* funcArg = AI;

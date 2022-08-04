@@ -21,6 +21,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/DataLayout.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "llvmWrapper/IR/Instructions.h"
 
 namespace llvm
 {
@@ -198,6 +199,7 @@ namespace IGC
         bool MatchPredicate(llvm::SelectInst& I);
         bool MatchSelectModifier(llvm::SelectInst& I);
         bool MatchPow(llvm::IntrinsicInst& I);
+        bool MatchGenericPointersCmp(llvm::CmpInst& I);
         bool MatchCondModifier(llvm::CmpInst& I);
         bool MatchBoolOp(llvm::BinaryOperator& I);
         bool MatchFunnelShiftRotate(llvm::IntrinsicInst& I);
@@ -211,7 +213,6 @@ namespace IGC
         bool MatchRsqrt(llvm::BinaryOperator& I);
         bool MatchLoadStorePointer(llvm::Instruction& I, llvm::Value& ptrVal);
         bool MatchBlockReadWritePointer(llvm::GenIntrinsicInst& I);
-        bool MatchURBRead(llvm::GenIntrinsicInst& I);
         bool MatchGradient(llvm::GenIntrinsicInst& I);
         bool MatchSampleDerivative(llvm::GenIntrinsicInst& I);
         bool MatchDbgInstruction(llvm::DbgInfoIntrinsic& I);
@@ -260,6 +261,7 @@ namespace IGC
         bool IsConstOrSimdConstExpr(llvm::Value* C);
         bool FlushesDenormsOnOutput(llvm::Instruction& I);
         bool FlushesDenormsOnInput(llvm::Instruction& I);
+        bool ContractionAllowed(llvm::Instruction& I) const;
 
         // Place a constant Val into the constant pool. This constant should be
         // available in basic block UseBlock.
@@ -339,7 +341,7 @@ namespace IGC
     {
         if (llvm::CallInst * intrin = llvm::dyn_cast<llvm::CallInst>(&v))
         {
-            return intrin->getNumArgOperands();
+            return IGCLLVM::getNumArgOperands(intrin);
         }
         return v.getNumOperands();
     }

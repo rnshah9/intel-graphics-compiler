@@ -874,6 +874,7 @@ llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::Create_MemoryFence(
         this->getInt1(flushInstructionCache),
         this->getInt1(globalFence),
         this->getInt1(false),
+        this->getInt1(false),
     };
     llvm::Module* module = this->GetInsertBlock()->getParent()->getParent();
     return this->CreateCall(
@@ -3736,13 +3737,12 @@ inline llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::create_wavePrefix
 inline llvm::CallInst* setUnsafeToHoistAttr(llvm::CallInst *CI)
     {
         CI->setConvergent();
-#if LLVM_VERSION_MAJOR >= 7
+#if LLVM_VERSION_MAJOR >= 14
+        CI->setOnlyAccessesInaccessibleMemory();
+        CI->removeAttributeAtIndex(llvm::AttributeList::FunctionIndex, llvm::Attribute::ReadNone);
+#else
         CI->setOnlyAccessesInaccessibleMemory();
         CI->removeAttribute(llvm::AttributeList::FunctionIndex, llvm::Attribute::ReadNone);
-#else
-        CI->addAttribute(
-            llvm::AttributeSet::FunctionIndex, llvm::Attribute::InaccessibleMemOnly);
-        CI->removeAttribute(llvm::AttributeSet::FunctionIndex, llvm::Attribute::ReadNone);
 #endif
         llvm::OperandBundleDef OpDef("nohoist", llvm::None);
 

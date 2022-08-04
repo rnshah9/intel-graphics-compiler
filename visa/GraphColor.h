@@ -561,12 +561,14 @@ namespace vISA
         LIVERANGE_LIST constrainedWorklist;
         unsigned numColor = 0;
 
+        bool failSafeIter = false;
+
         unsigned edgeWeightGRF(const LiveRange* lr1, const LiveRange* lr2);
         unsigned edgeWeightARF(const LiveRange* lr1, const LiveRange* lr2);
 
         void computeDegreeForGRF();
         void computeDegreeForARF();
-        void computeSpillCosts(bool useSplitLLRHeuristic);
+        void computeSpillCosts(bool useSplitLLRHeuristic, const RPE* rpe);
         void determineColorOrdering();
         void removeConstrained();
         void relaxNeighborDegreeGRF(LiveRange* lr);
@@ -1213,11 +1215,13 @@ namespace vISA
                 verifyAugmentation = std::make_unique<VerifyAugmentation>();
             }
 
-            // Need call WA for EU Fusion for non-entry function
+            // Set callWA condition.
+            //    Call return ip and mask need wa only for non-entry functions. As call WA
+            //    also needs a temp, we conservatively add WA for caller-save/callee-save
+            //    code too, which applies to all functions, including the entry function.
             m_EUFusionCallWANeeded = builder.hasFusedEU()
-                && builder.getOption(vISA_fusedCallWA)
+                && builder.getuint32Option(vISA_fusedCallWA) == 1
                 && (kernel.fg.getHasStackCalls() || kernel.hasIndirectCall());
-                //&& !builder.getIsKernel(); // if caller save tmp is forced w/ M16, caller save/restore must be forced with M16.
         }
 
         void emitFGWithLiveness(const LivenessAnalysis& liveAnalysis) const;
@@ -1462,6 +1466,30 @@ namespace vISA
 
         }
 
+    };
+
+    class DynPerfModel
+    {
+    private:
+        std::string Buffer;
+
+    public:
+        G4_Kernel& Kernel;
+        unsigned int NumSpills = 0;
+        unsigned int NumFills = 0;
+        unsigned int NumRAIters = 0;
+        unsigned long long TotalDynInst = 0;
+        unsigned long long FillDynInst = 0;
+        unsigned long long SpillDynInst = 0;
+        // vector item at index i corresponds to nesting level i
+        // #Loops at this nesting level, #Spills, #Fills
+        std::vector<std::tuple<unsigned int, unsigned int, unsigned int>> SpillFillPerNestingLevel;
+
+        DynPerfModel(G4_Kernel& K) : Kernel(K)
+        {}
+
+        void run();
+        void dump();
     };
 }
 

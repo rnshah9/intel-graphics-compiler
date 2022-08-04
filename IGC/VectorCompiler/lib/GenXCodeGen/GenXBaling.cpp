@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -11,8 +11,6 @@ SPDX-License-Identifier: MIT
 // detailed comment.
 //
 //===----------------------------------------------------------------------===//
-#define DEBUG_TYPE "GENX_INSTRUCTION_BALING"
-
 #include "GenXBaling.h"
 #include "GenXConstants.h"
 #include "GenXIntrinsics.h"
@@ -32,7 +30,6 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
-#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
@@ -41,9 +38,12 @@ SPDX-License-Identifier: MIT
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Utils/Local.h"
 
+#include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 
 #include "Probe/Assertion.h"
+
+#define DEBUG_TYPE "GENX_INSTRUCTION_BALING"
 
 // Part of the bodge to allow abs to bale in to sext/zext. This needs to be set
 // to some arbitrary value that does not clash with any
@@ -249,7 +249,8 @@ void GenXBaling::processInst(Instruction *Inst)
  * otherwise, if the region is considered baled and skip legalization,
  * we may have illegal standalone read-region.
  */
-bool GenXBaling::isRegionOKForIntrinsic(unsigned ArgInfoBits, const Region &R,
+bool GenXBaling::isRegionOKForIntrinsic(unsigned ArgInfoBits,
+                                        const vc::Region &R,
                                         bool CanSplitBale) {
   GenXIntrinsicInfo::ArgInfo AI(ArgInfoBits);
   if (!AI.isGeneral())
@@ -526,7 +527,7 @@ bool GenXBaling::operandCanBeBaled(
     // - it is indirect.
     // as bitcast will not bale its operands and indirect multiple-use region
     // reads often lead to narrow simd width after legalization.
-    if (Opnd->getNumUses() > 1 && (Kind == BalingKind::BK_Legalization ||
+    if (Opnd->hasNUsesOrMore(2) && (Kind == BalingKind::BK_Legalization ||
                                    Kind == BalingKind::BK_Analysis)) {
       for (auto U : Opnd->users())
         if (isa<BitCastInst>(U))
@@ -973,7 +974,7 @@ void GenXBaling::processInlineAsm(Instruction *Inst) {
   IGC_ASSERT_MESSAGE(CI->isInlineAsm(), "Inline Asm expected");
 
   BaleInfo BI(BaleInfo::MAININST);
-  for (unsigned I = 0; I < CI->getNumArgOperands(); I++)
+  for (unsigned I = 0; I < IGCLLVM::getNumArgOperands(CI); I++)
     if (auto RdR = dyn_cast<Instruction>(CI->getArgOperand(I)))
       if (GenXIntrinsic::isRdRegion(RdR)) {
         switch (GenXIntrinsic::getGenXIntrinsicID(RdR->getOperand(0))) {
@@ -1001,7 +1002,7 @@ void GenXBaling::processFuncPointer(Instruction *Inst) {
   IGC_ASSERT_MESSAGE(CI, "genx.faddr expected");
   IGC_ASSERT_MESSAGE(GenXIntrinsic::getGenXIntrinsicID(CI) == GenXIntrinsic::genx_faddr,
     "genx.faddr expected");
-  IGC_ASSERT(Inst->getNumUses() == 1);
+  IGC_ASSERT(Inst->hasOneUse());
   auto *NextUser = Inst->user_back();
   if (isa<BitCastInst>(NextUser)) {
     // bitcasts <N x i64> -> <2*N x i32> may appear after i64 emulation
@@ -1626,7 +1627,7 @@ void GenXBaling::processBranch(BranchInst *Branch)
  */
 void GenXBaling::processTwoAddrSend(CallInst *CI)
 {
-  unsigned TwoAddrOperandNum = CI->getNumArgOperands() - 1;
+  unsigned TwoAddrOperandNum = IGCLLVM::getNumArgOperands(CI) - 1;
   IGC_ASSERT(GenXIntrinsicInfo(vc::getAnyIntrinsicID(CI))
       .getArgInfo(TwoAddrOperandNum)
       .getCategory() == GenXIntrinsicInfo::TWOADDR);

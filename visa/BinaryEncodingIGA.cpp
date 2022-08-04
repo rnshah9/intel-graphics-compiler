@@ -9,13 +9,14 @@ SPDX-License-Identifier: MIT
 #include "BinaryEncodingIGA.h"
 #include "GTGPU_RT_ASM_Interface.h"
 #include "iga/IGALibrary/api/igaEncoderWrapper.hpp"
+#include "iga/IGALibrary/Frontend/FormatterJSON.hpp"
 #include "Timer.h"
 #include "BuildIR.h"
 #include "Common_ISA_framework.h"
 
+#include <fstream>
 #include <map>
 #include <utility>
-
 
 using namespace iga;
 using namespace vISA;
@@ -29,14 +30,14 @@ struct SendExDescOpts {
 
 class BinaryEncodingIGA
 {
-    int               IGAInstId = 0;
-    Mem_Manager&      mem;
-    G4_Kernel&        kernel;
-    std::string       fileName;
-    Kernel*      IGAKernel = nullptr;
-    const Model* platformModel;
+    int                     IGAInstId = 0;
+    int                     IGABlockId = 0;
+    Mem_Manager&            mem;
+    G4_Kernel&              kernel;
+    std::string             fileName; // .dat filename
+    Kernel*                 IGAKernel = nullptr;
+    const Model*            platformModel;
     const TARGET_PLATFORM   platform;
-
 public:
     BinaryEncodingIGA(vISA::Mem_Manager &m, vISA::G4_Kernel& k, std::string fname);
     ~BinaryEncodingIGA() {delete IGAKernel;}
@@ -45,6 +46,8 @@ public:
 
     // translates and encodes (formerly "DoAll")
     void Encode();
+
+    void EmitJSON(int dumpJSON);
 
     ///////////////////////////////////////////////////////////////////////////
     // these function translate G4 IR to IGA IR
@@ -55,7 +58,6 @@ public:
 
     void FixInst();
     void *EmitBinary(size_t& binarySize);
-
 
 private:
     BinaryEncodingIGA(const BinaryEncodingIGA& other);
@@ -187,6 +189,7 @@ private:
         if (itr == labelToBlockMap.end())
         {
             b = IGAKernel.createBlock();
+            b->setID(IGABlockId++);
             labelToBlockMap[label] = b;
         }
         else {
@@ -346,18 +349,16 @@ Platform BinaryEncodingIGA::getIGAInternalPlatform(TARGET_PLATFORM genxPlatform)
         platform = Platform::XE_HP;
         break;
     case Xe_DG2:
+    case Xe_MTL:
         platform = Platform::XE_HPG;
         break;
     case Xe_PVC:
-        platform = Platform::XE_HPC;
-        break;
     case Xe_PVCXT:
         platform = Platform::XE_HPC;
         break;
     default:
         break;
     }
-
     return platform;
 }
 
@@ -432,6 +433,7 @@ InstOptSet BinaryEncodingIGA::getIGAInstOptSet(G4_INST* inst) const
     {
         options.add(InstOpt::NOCOMPACT);
     }
+
 
     return options;
 }
@@ -913,6 +915,7 @@ void BinaryEncodingIGA::Encode()
     {
         // create a new BB if kernel does not start with label
         currBB = IGAKernel->createBlock();
+        currBB->setID(IGABlockId++);
         IGAKernel->appendBlock(currBB);
     }
 
@@ -978,7 +981,7 @@ void BinaryEncodingIGA::Encode()
             // for a single G4_INST, then it should be safe to
             // make pair between the G4_INST and first encoded
             // binary inst.
-            encodedInsts.push_back(std::make_pair(igaInst, inst));
+            encodedInsts.emplace_back(igaInst, inst);
         }
     }
 
@@ -1006,7 +1009,7 @@ void BinaryEncodingIGA::Encode()
             encoder.enableIGAAutoDeps();
         }
 
-        encoder.encode();
+        encoder.encode(kernel.fg.builder->criticalMsgStream());
 
         m_kernelBufferSize = encoder.getBinarySize();
         m_kernelBuffer = allocCodeBlock(m_kernelBufferSize);
@@ -1037,8 +1040,24 @@ void BinaryEncodingIGA::Encode()
         kernel.fg.builder->getJitInfo()->offsetToSkipSetFFIDGP1 =
             kernel.getComputeFFIDGP1NextOff();
     }
+
+    int dumpJSON = kernel.fg.builder->getuint32Option(vISA_dumpIgaJson);
+    if (dumpJSON) {
+        EmitJSON(dumpJSON);
+    }
 }
 
+void BinaryEncodingIGA::EmitJSON(int dumpJSON) {
+    std::string jsonFileName = fileName + ".json";
+    std::ofstream ofs(jsonFileName, std::ofstream::out);
+    FormatOpts fos(*platformModel);
+    fos.printJson = true;
+    if (dumpJSON > 1) {
+        fos.printInstDefs = true;
+    }
+    iga::ErrorHandler eh;
+    FormatKernel(eh, ofs, fos, *IGAKernel);
+}
 
 Instruction *BinaryEncodingIGA::translateInstruction(
     G4_INST *g4inst, Block*& bbNew)
@@ -1135,7 +1154,8 @@ Instruction *BinaryEncodingIGA::translateInstruction(
     }
 
     igaInst->setID(IGAInstId++);
-    igaInst->setLoc(g4inst->getCISAOff()); // make IGA src off track CISA id
+    int visaOff = g4inst->getCISAOff();
+    igaInst->setLoc(visaOff); // make IGA src off track CISA id
 
     if (opSpec->supportsDestination())
     {
@@ -1243,6 +1263,7 @@ void BinaryEncodingIGA::translateInstructionBranchSrcs(
     {
         // Creating a fall through block
         bbNew = IGAKernel->createBlock();
+        bbNew->setID(IGABlockId++);
         igaInst->setLabelSource(SourceIndex::SRC0, bbNew, Type::UD);
         IGAKernel->appendBlock(bbNew);
     }
@@ -1405,7 +1426,6 @@ void BinaryEncodingIGA::translateInstructionSrcs(
         }
     } // for
 }
-
 
 SendDesc BinaryEncodingIGA::getIGASendDesc(G4_INST* sendInst) const
 {
@@ -1683,7 +1703,7 @@ RegName BinaryEncodingIGA::getIGAARFName(G4_ArchRegKind areg)
     case AREG_ACC0:
     case AREG_ACC1:     return RegName::ARF_ACC;
     case AREG_MASK0:    return RegName::ARF_CE;
-    case AREG_MS0:      return RegName::ARF_MSG;
+    case AREG_MSG0:     return RegName::ARF_MSG;
     case AREG_DBG:      return RegName::ARF_DBG;
     case AREG_SR0:      return RegName::ARF_SR;
     case AREG_CR0:      return RegName::ARF_CR;
@@ -1948,6 +1968,8 @@ SWSB_ENCODE_MODE vISA::GetIGASWSBEncodeMode(const IR_Builder& builder) {
         return SWSB_ENCODE_MODE::SWSBInvalidMode;
 
     if (builder.hasThreeALUPipes()) {
+        if (builder.getPlatform() == Xe_MTL)
+            return SWSB_ENCODE_MODE::ThreeDistPipeDPMath;
         return SWSB_ENCODE_MODE::ThreeDistPipe;
     }
     else if (builder.hasFourALUPipes()) {
@@ -1993,4 +2015,3 @@ bool vISA::InstSupportsSrcModifierIGA(TARGET_PLATFORM p, const G4_INST &i, const
         return false;
     }
 }
-

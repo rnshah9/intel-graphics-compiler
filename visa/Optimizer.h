@@ -274,17 +274,13 @@ private:
     void resetA0();
     void setA0toTdrForSendc();
     void replaceRetWithJmpi();
-    void doNoMaskWA();
-    void newDoNoMaskWA();
     void prepareNoMaskWA();
     void applyNoMaskWA();
     void applyFusedCallWA();
     void finishFusedCallWA_preSWSB();
     void finishFusedCallWA();
-    void doNoMaskWA_postRA();
-    void newDoNoMaskWA_postRA();
     bool NoMaskWAUseRAList() const { return true; }
-    bool allPostRANoMaskWA() const { return builder.getuint32Option(vISA_newTmpNoMaskWA) >= 2; }
+    bool allPostRANoMaskWA() const { return true; }
     void insertFenceAtEntry();
     void expandMulPostSchedule();
     void expandMadwPostSchedule();
@@ -457,12 +453,9 @@ public:
         // Normally, noMask Info will be freed in postRA workaround.
         // But in case RA fails, postRA will not be invoked. Thus, need
         // to free memory allocated in preRA_HWWorkaround() here as well.
-        if (builder.useNewNoMaskWA())
+        if (builder.hasFusedEUNoMaskWA())
         {
-            if (builder.hasFusedEUNoMaskWA())
-            {
-                kernel.clearNoMaskInfo();
-            }
+            kernel.deleteEUFusionNoMaskWAInfo();
         }
     }
     int optimization();

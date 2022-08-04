@@ -85,7 +85,6 @@ SPDX-License-Identifier: MIT
 /// GenXLiveness has another go at splitting them up.
 ///
 //===----------------------------------------------------------------------===//
-#define DEBUG_TYPE "GENX_LOWERING"
 
 #include "GenX.h"
 #include "GenXGotoJoin.h"
@@ -131,6 +130,8 @@ SPDX-License-Identifier: MIT
 #include <iterator>
 #include <numeric>
 #include "Probe/Assertion.h"
+
+#define DEBUG_TYPE "GENX_LOWERING"
 
 using namespace llvm;
 using namespace genx;
@@ -218,6 +219,8 @@ private:
   bool splitGatherScatter(CallInst *CI, unsigned IID);
   bool processTwoAddressOpnd(CallInst *CI);
   bool processInst(Instruction *Inst);
+  bool lowerAbs(CallInst *CI);
+  bool lowerAllAny(CallInst *CI);
   bool lowerRdRegion(Instruction *Inst);
   bool lowerWrRegion(Instruction *Inst);
   bool lowerRdPredRegion(Instruction *Inst);
@@ -263,7 +266,6 @@ private:
   bool lowerFMulAdd(CallInst *CI);
   bool lowerBitreverse(CallInst *CI);
   bool lowerFunnelShift(CallInst *CI, unsigned IntrinsicID);
-  bool lowerFAbs(CallInst *CI);
   bool lowerF32MathIntrinsic(CallInst *CI, GenXIntrinsic::ID GenXID);
   bool lowerF32FastMathIntrinsic(CallInst *CI, GenXIntrinsic::ID GenXID);
   bool lowerSlmInit(CallInst *CI);
@@ -363,7 +365,7 @@ bool GenXLowering::processTwoAddressOpnd(CallInst *CI) {
     Type *Ty = CI->getArgOperand(*OpNum)->getType();
     IGC_ASSERT_MESSAGE(Ty == CI->getType(), "two address op type out of sync");
 
-    for (unsigned i = 0; i < CI->getNumArgOperands(); ++i) {
+    for (unsigned i = 0; i < IGCLLVM::getNumArgOperands(CI); ++i) {
       auto Op = dyn_cast<Constant>(CI->getArgOperand(i));
       // Check if the predicate operand is all true.
       if (Op && Op->getType()->getScalarSizeInBits() == 1) {
@@ -408,7 +410,7 @@ static bool isNewLoadInst(CallInst *Inst) {
 // Returns nullptr on failure.
 static CallInst *getLoadWrregion(CallInst *Inst) {
   IGC_ASSERT_MESSAGE(isNewLoadInst(Inst), "Expected new load intrinsics");
-  if (Inst->getNumUses() != 1)
+  if (!Inst->hasOneUse())
     return nullptr;
 
   auto *WrR = dyn_cast<CallInst>(Inst->user_back());
@@ -422,7 +424,7 @@ static CallInst *getLoadWrregion(CallInst *Inst) {
 // TODO: maybe just lower every select to wrregion in lowerSelect?
 static SelectInst *getLoadSelect(CallInst *Inst) {
   IGC_ASSERT_MESSAGE(isNewLoadInst(Inst), "Expected new load intrinsics");
-  if (Inst->getNumUses() != 1)
+  if (!Inst->hasOneUse())
     return nullptr;
 
   auto *SI = dyn_cast<SelectInst>(Inst->user_back());
@@ -993,7 +995,7 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
   for (auto CurWidth : Widths) {
     SmallVector<Value *, 8> Args;
     // initialize the args with the old values
-    for (unsigned ArgI = 0; ArgI < CI->getNumArgOperands(); ++ArgI)
+    for (unsigned ArgI = 0; ArgI < IGCLLVM::getNumArgOperands(CI); ++ArgI)
       Args.push_back(CI->getArgOperand(ArgI));
     // Predicate
     if (PredIdx != NONEED) {
@@ -1430,20 +1432,14 @@ static Value *ExpandAddrOrData(CallInst *CI, unsigned ArgIdx, unsigned ArgWidth,
 //   x = <16> gather4_scaled2 <8> addrs
 // After:
 //   newaddrs = <16> wrregion undef, addrs
-// bale {
 //   tmp = <32> gather4_scaled2 newaddrs
-//   wrrpred = <32> shufflevec oldpred, undef, mask
-//   wrr = wrregion <32> undef, tmp, 0, xpred
-//  }
 // bale {
-//   chR = rdregion <8> wrr, 0
-//   chRpred = <8> shufflevec oldpred, undef, chmask
-//   partialx = wrregion <8> oldval, chR, 0, chRpred
+//   chR = rdregion <8> tmp, 0
+//   partialx = wrregion <8> oldval, chR, 0
 // }
 // bale {
-//   chG = rdregion <8> wrr, 16 * 4
-//   chGpred = <8> shuffleve oldpred, undef, chmask
-//   x = wrregion <8> partialx, chG, 8 * 4, chGpred
+//   chG = rdregion <8> tmp, 16 * 4
+//   x = wrregion <8> partialx, chG, 8 * 4
 // }
 static bool widenNewSIMD8Load(CallInst *CI, unsigned IID,
                               const GenXSubtarget *ST,
@@ -1499,6 +1495,7 @@ static bool widenNewSIMD8Load(CallInst *CI, unsigned IID,
 
   // Generate new wide load.
   Value *NewLoad;
+  Value *NewPred;
   {
     Type *NewLoadType = IGCLLVM::FixedVectorType::get(ElemType, NewLoadWidth);
     SmallVector<Value *, 8> Args(CI->arg_begin(), CI->arg_end());
@@ -1507,16 +1504,17 @@ static bool widenNewSIMD8Load(CallInst *CI, unsigned IID,
     switch (IID) {
     case GenXIntrinsic::genx_gather4_masked_scaled2: {
       IGC_ASSERT_MESSAGE(ChannelWidth == 8,
-                         "Unexpected gather4_maked_scaled width");
+                         "Unexpected gather4_masked_scaled width");
       Args[4] = NewAddrs;
       // Expand predicate to the size of NewAddrs
-      OldPred =
+      OldPred = CI->getOperand(5);
+      NewPred =
           ExpandPredicate(CI, 5 /* PredIdx */,
                           cast<IGCLLVM::FixedVectorType>(NewAddrs->getType())
                               ->getNumElements());
-      Args[5] = OldPred;
+      Args[5] = NewPred;
       Tys.push_back(NewAddrs->getType());
-      Tys.push_back(OldPred->getType());
+      Tys.push_back(NewPred->getType());
       break;
     }
     case GenXIntrinsic::genx_gather4_scaled2: {
@@ -1536,24 +1534,6 @@ static bool widenNewSIMD8Load(CallInst *CI, unsigned IID,
     NewLoad = NewCI;
   }
 
-  // Generate wrregion for new load.
-  {
-    Type *NewLoadType = NewLoad->getType();
-    Value *LoadPred = generatePredicateForLoadWrregion(
-        OldPred, 0, NewLoadWidth, NumChannels, CI, DL, "load.wide.pred");
-    Region Rgn(NewLoadType);
-    Rgn.Mask = LoadPred;
-    // If there is only one channel we can exit early.
-    if (NumChannels == 1) {
-      Rgn.Offset = InitialOffset;
-      NewResult = Rgn.createWrRegion(NewResult, NewLoad, "load.wide.wrregion", CI, DL);
-      InstToReplace->replaceAllUsesWith(NewResult);
-      return true;
-    }
-    NewLoad = Rgn.createWrRegion(UndefValue::get(NewLoadType), NewLoad,
-                                 "load.wide.wrregion", CI, DL);
-  }
-
   // Shuffle channels.
   unsigned ElemByteSize = ElemType->getScalarSizeInBits() / 8;
   Type *ChannelType = IGCLLVM::FixedVectorType::get(ElemType, ChannelWidth);
@@ -1563,10 +1543,8 @@ static bool widenNewSIMD8Load(CallInst *CI, unsigned IID,
     RdR.Offset = i * NewChannelWidth * ElemByteSize;
     Value *NewChannel =
         RdR.createRdRegion(NewLoad, "load.wide.channel.read", CI, DL);
-    Value *NewChannelPred = generatePredicateForLoadWrregion(
-        OldPred, 0, ChannelWidth, 1, CI, DL, "load.wide.channel.pred");
     WrR.Offset = InitialOffset + i * ChannelWidth * ElemByteSize;
-    WrR.Mask = NewChannelPred;
+    WrR.Mask = OldPred;
     NewResult = WrR.createWrRegion(NewResult, NewChannel,
                                    "load.wide.channel.write", CI, DL);
   }
@@ -1709,7 +1687,7 @@ bool GenXLowering::widenSIMD8GatherScatter(CallInst *CI, unsigned IID) {
   }
 
   SmallVector<Value *, 8> Args;
-  for (unsigned i = 0; i < CI->getNumArgOperands(); ++i) {
+  for (unsigned i = 0; i < IGCLLVM::getNumArgOperands(CI); ++i) {
     Args.push_back(CI->getArgOperand(i));
   }
   Args[PredIdx] = ExpandPredicate(CI, PredIdx, WidenSIMD);
@@ -1945,73 +1923,70 @@ static void TranslateDWordAtomic(LSC_OP SubOp, CallInst *CI) {
 
 static void TranslateSVMAtomic(LSC_OP SubOp, CallInst *CI) {
   IntegerType *I8Ty = Type::getInt8Ty(CI->getContext());
-  auto CZeroInt8 = ConstantInt::get(I8Ty, 0);
+  auto *CZeroInt8 = ConstantInt::get(I8Ty, 0);
   IntegerType *I16Ty = Type::getInt16Ty(CI->getContext());
-  auto COneInt16 = ConstantInt::get(I16Ty, 1);
+  auto *COneInt16 = ConstantInt::get(I16Ty, 1);
   IntegerType *I32Ty = Type::getInt32Ty(CI->getContext());
-  auto CZeroInt32 = ConstantInt::get(I32Ty, 0);
+  auto *CZeroInt32 = ConstantInt::get(I32Ty, 0);
 
   unsigned DataIdx = 2;
   unsigned PredIdx = 0;
   unsigned AddrIdx = 1;
 
+  Value *Pred = CI->getArgOperand(PredIdx);
+  Value *Addr = CI->getArgOperand(AddrIdx);
+
   auto Width =
-      cast<IGCLLVM::FixedVectorType>(CI->getArgOperand(PredIdx)->getType())
-          ->getNumElements();
-  IGC_ASSERT(Width == 8 || Width == 16 || Width == 32);
-  SmallVector<Value *, 15> Args;
-  Args.push_back(ExpandPredicate(CI, PredIdx, 32));         // #0, Predicate
-  Args.push_back(ConstantInt::get(I8Ty, SubOp));            // #1, subopcode
-  Args.push_back(CZeroInt8);                                // #2, L1 control
-  Args.push_back(CZeroInt8);                                // #3, L3 control
-  Args.push_back(COneInt16);                                // #4, scale
-  Args.push_back(CZeroInt32);                               // #5, immed-offset
-  Args.push_back(LSCDatumSize(CI->getArgOperand(DataIdx))); // #6
-  Args.push_back(ConstantInt::get(I8Ty, LSC_DATA_ORDER_NONTRANSPOSE)); // #7
-  Args.push_back(
-      ConstantInt::get(I8Ty, LSCVectorSize(1))); // #8, num-elem is one
-  Args.push_back(CZeroInt8);                     // #9, no-channel-mask
-  Args.push_back(CZeroInt32);                    // #10, SurfaceIndex
-  Args.push_back(ExpandAddrOrData(CI, AddrIdx, Width, 1, 32)); // #11, address
+      cast<IGCLLVM::FixedVectorType>(Pred->getType())->getNumElements();
+  IGC_ASSERT(isPowerOf2_32(Width) && Width <= 32);
+
+  SmallVector<Value *, 15> Args = {
+      Pred,                                     // #0, Predicate
+      ConstantInt::get(I8Ty, SubOp),            // #1, subopcode
+      CZeroInt8,                                // #2, L1 control
+      CZeroInt8,                                // #3, L3 control
+      COneInt16,                                // #4, scale
+      CZeroInt32,                               // #5, immed-offset
+      LSCDatumSize(CI->getArgOperand(DataIdx)), // #6, datum size
+      ConstantInt::get(I8Ty, LSCVectorSize(1)), // #7, num-elem is one
+      ConstantInt::get(I8Ty, LSC_DATA_ORDER_NONTRANSPOSE), // #8
+      CZeroInt8, // #9, no-channel-mask
+      Addr,      // #10, address
+  };
 
   Value *DataV = CI->getArgOperand(DataIdx);
-  auto *DataVector = cast<IGCLLVM::FixedVectorType>(DataV->getType());
-  IGC_ASSERT_MESSAGE(Width == DataVector->getNumElements(),
-    "Cannot translate svm-atomics more than one element per lane");
-  auto DataV32Ty = IGCLLVM::FixedVectorType::get(
-      DataVector->getElementType(), 32);
+  auto *DataVTy = cast<IGCLLVM::FixedVectorType>(DataV->getType());
+  IGC_ASSERT_MESSAGE(
+      Width == DataVTy->getNumElements(),
+      "Cannot translate svm-atomics more than one element per lane");
+
   if (SubOp == LSC_ATOMIC_IINC || SubOp == LSC_ATOMIC_IDEC) {
-    Args.push_back(UndefValue::get(DataV32Ty));
-    Args.push_back(UndefValue::get(DataV32Ty));
+    Args.push_back(UndefValue::get(DataVTy)); // #11, nil
+    Args.push_back(UndefValue::get(DataVTy)); // #12, nil
   } else if (SubOp == LSC_ATOMIC_ICAS || SubOp == LSC_ATOMIC_FCAS) {
-    // exchange source ooperand order
-    Args.push_back(ExpandAddrOrData(CI, DataIdx+1, Width, 1, 32)); // #12, src1
-    Args.push_back(ExpandAddrOrData(CI, DataIdx, Width, 1, 32)); // #13, src0
+    // exchange source operand order
+    Args.push_back(CI->getArgOperand(DataIdx + 1)); // #11, src1
+    Args.push_back(CI->getArgOperand(DataIdx));     // #12, src0
     DataIdx += 2;
   } else {
-    Args.push_back(ExpandAddrOrData(CI, DataIdx, Width, 1, 32)); // #12, src0
-    Args.push_back(UndefValue::get(DataV32Ty));
+    Args.push_back(CI->getArgOperand(DataIdx)); // #11, src0
+    Args.push_back(UndefValue::get(DataVTy));   // #12, nil
     DataIdx++;
   }
+  Args.push_back(CZeroInt32);                 // #13, SurfaceIndex
+  Args.push_back(CI->getArgOperand(DataIdx)); // #14, old-data
 
-  Args.push_back(ExpandAddrOrData(CI, DataIdx, Width, 1, 32)); // #14, old-data
+  // create the call to lsc.xatomic.stateless instructions
+  Type *Tys[] = {DataVTy, Pred->getType(), Addr->getType()};
+  auto *Decl = GenXIntrinsic::getGenXDeclaration(
+      CI->getModule(), GenXIntrinsic::genx_lsc_xatomic_stateless, Tys);
 
-  // create the call to 32 wide lsc.atomic.stateless instructions.
-  Type *Tys[] = {Args[0]->getType(), Args[11]->getType(), DataV32Ty};
-  auto Decl = GenXIntrinsic::getGenXDeclaration(
-      CI->getModule(), GenXIntrinsic::genx_lsc_atomic_stateless, Tys);
-  auto NewInst = CallInst::Create(Decl, Args, CI->getName() + VALUE_NAME(".lsc"), CI);
+  auto *NewInst =
+      CallInst::Create(Decl, Args, CI->getName() + VALUE_NAME(".lsc"), CI);
   NewInst->setDebugLoc(CI->getDebugLoc());
-  if (!CI->use_empty()) {
-    if (Width < 32) {
-      Region R(CI->getType());
-      R.Width = Width;
-      R.NumElements = Width;
-      auto NewVec = R.createRdRegion(NewInst, "", CI, CI->getDebugLoc());
-      CI->replaceAllUsesWith(NewVec);
-    } else
-      CI->replaceAllUsesWith(NewInst);
-  }
+
+  if (!CI->use_empty())
+    CI->replaceAllUsesWith(NewInst);
 }
 
 static void ComputeScatterAddress(CallInst *CI, unsigned ScaleIdx,
@@ -3252,7 +3227,7 @@ bool GenXLowering::processInst(Instruction *Inst) {
     unsigned IntrinsicID = GenXIntrinsic::not_any_intrinsic;
     if (Function *Callee = CI->getCalledFunction()) {
       IntrinsicID = vc::getAnyIntrinsicID(Callee);
-      IGC_ASSERT(CI->getNumArgOperands() < GenXIntrinsicInfo::OPNDMASK);
+      IGC_ASSERT(IGCLLVM::getNumArgOperands(CI) < GenXIntrinsicInfo::OPNDMASK);
     }
     if (ST) {
       // use gather/scatter to implement SLM oword load/store on
@@ -3290,6 +3265,9 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return generatePredicatedWrrForNewLoad(CI);
 
     switch (IntrinsicID) {
+    case GenXIntrinsic::genx_all:
+    case GenXIntrinsic::genx_any:
+      return lowerAllAny(CI);
     case GenXIntrinsic::genx_rdregioni:
     case GenXIntrinsic::genx_rdregionf:
       return lowerRdRegion(Inst);
@@ -3363,6 +3341,12 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return lowerTrap(CI);
     case Intrinsic::ctpop:
       return lowerCtpop(CI);
+#if LLVM_VERSION_MAJOR >= 12
+    case Intrinsic::smin:
+    case Intrinsic::smax:
+    case Intrinsic::umin:
+    case Intrinsic::umax:
+#endif
     case Intrinsic::minnum:
     case Intrinsic::maxnum:
       return lowerMinMax(CI, IntrinsicID);
@@ -3401,8 +3385,11 @@ bool GenXLowering::processInst(Instruction *Inst) {
     case Intrinsic::fshl:
     case Intrinsic::fshr:
       return lowerFunnelShift(CI, IntrinsicID);
+#if LLVM_VERSION_MAJOR >= 12
+    case Intrinsic::abs:
+#endif
     case Intrinsic::fabs:
-      return lowerFAbs(CI);
+      return lowerAbs(CI);
     case Intrinsic::ceil:
       return lowerF32MathIntrinsic(CI, GenXIntrinsic::genx_rndu);
     case Intrinsic::floor:
@@ -3432,6 +3419,54 @@ bool GenXLowering::processInst(Instruction *Inst) {
     Inst->getContext().emitError(Inst,
         "GenX backend cannot handle allocas with CMRT yet");
   return false;
+}
+
+/***********************************************************************
+ * lowerAllAny : handle all and any intrinsics
+ *
+ * Return:  whether any change was made, and thus the current instruction
+ *          is now marked for erasing
+ *
+ */
+bool GenXLowering::lowerAllAny(CallInst *CI) {
+  auto *Op = CI->getArgOperand(0);
+
+  IRBuilder<> Builder(CI);
+
+  auto *SrcTy = cast<IGCLLVM::FixedVectorType>(Op->getType());
+  auto NElem = SrcTy->getNumElements();
+  Type *Int1Ty = Type::getInt1Ty(CI->getContext());
+  Type *Ty = IGCLLVM::FixedVectorType::get(Int1Ty, NElem);
+
+  if (SrcTy->isIntOrIntVectorTy(1) && NElem > 1)
+    return false;
+
+  Value *Arg = nullptr;
+
+  if (auto *Ext = dyn_cast<SExtInst>(Op))
+    Arg = Ext->getOperand(0);
+  else if (auto *Ext = dyn_cast<ZExtInst>(Op))
+    Arg = Ext->getOperand(0);
+  else if (!SrcTy->isIntOrIntVectorTy(1))
+    Arg = Builder.CreateICmpNE(Op, ConstantInt::get(SrcTy, 0));
+  else
+    Arg = Op;
+
+  Value *NewInst = nullptr;
+
+  if (NElem > 1) {
+    auto IntrID = GenXIntrinsic::getGenXIntrinsicID(CI);
+    auto *Fn = GenXIntrinsic::getGenXDeclaration(CI->getModule(), IntrID, {Ty});
+    NewInst =
+        Builder.CreateCall(Fn, {Arg}, CI->getName() + VALUE_NAME(".lowered"));
+  } else
+    NewInst = Builder.CreateBitCast(Arg, Int1Ty,
+                                    CI->getName() + VALUE_NAME(".lowered"));
+
+  CI->replaceAllUsesWith(NewInst);
+
+  ToErase.push_back(CI);
+  return true;
 }
 
 /***********************************************************************
@@ -3924,8 +3959,22 @@ bool GenXLowering::lowerBoolScalarSelect(SelectInst *SI) {
   //         BB4
   //
   auto BB1 = SI->getParent();
-  auto BB2 = SplitBlock(BB1, SI, DT);
-  auto BB4 = SplitEdge(BB1, BB2, DT);
+  auto BB_ReturnedBySpitBlock = SplitBlock(BB1, SI, DT);
+  auto BB_ReturnedBySplitEdge = SplitEdge(BB1, BB_ReturnedBySpitBlock, DT);
+
+  BasicBlock *BB2;
+  BasicBlock *BB4;
+  // Make sure that BB2 is predecessor of BB4
+  if (BB_ReturnedBySpitBlock->getSinglePredecessor() == BB_ReturnedBySplitEdge)
+  {
+    BB2 = BB_ReturnedBySplitEdge;
+    BB4 = BB_ReturnedBySpitBlock;
+  }
+  else
+  {
+    BB4 = BB_ReturnedBySplitEdge;
+    BB2 = BB_ReturnedBySpitBlock;
+  }
   BB2->setName("select.false");
   BB4->setName("select.true");
 
@@ -4799,6 +4848,16 @@ bool GenXLowering::lowerUnorderedFCmpInst(FCmpInst *Inst) {
 
 static GenXIntrinsic::ID convertMinMaxIntrinsic(unsigned ID) {
   switch (ID) {
+#if LLVM_VERSION_MAJOR >= 12
+  case Intrinsic::smin:
+    return GenXIntrinsic::genx_smin;
+  case Intrinsic::smax:
+    return GenXIntrinsic::genx_smax;
+  case Intrinsic::umin:
+    return GenXIntrinsic::genx_umin;
+  case Intrinsic::umax:
+    return GenXIntrinsic::genx_umax;
+#endif
   case Intrinsic::minnum:
     return GenXIntrinsic::genx_fmin;
   case Intrinsic::maxnum:
@@ -4808,7 +4867,7 @@ static GenXIntrinsic::ID convertMinMaxIntrinsic(unsigned ID) {
   return GenXIntrinsic::not_any_intrinsic;
 }
 
-// Lower llvm minnum/maxnum to genx fmin/fmax.
+// Lower llvm min/max intrinsics to genx <ty>min/<ty>max.
 bool GenXLowering::lowerMinMax(CallInst *CI, unsigned IntrinsicID) {
   auto *ResTy = CI->getType();
   auto *MinMaxDecl = GenXIntrinsic::getGenXDeclaration(
@@ -4826,10 +4885,11 @@ bool GenXLowering::lowerSqrt(CallInst *CI) {
     "llvm.sqrt expected");
   auto *ResTy = CI->getType();
 
-  GenXIntrinsic::ID SqrtID = (CI->getType()->getScalarType()->isDoubleTy() ||
-                              !CI->getFastMathFlags().isFast())
-                                 ? GenXIntrinsic::genx_ieee_sqrt
-                                 : GenXIntrinsic::genx_sqrt;
+  auto *Ty = CI->getType()->getScalarType();
+  bool IsFast =
+      !Ty->isDoubleTy() && (CI->hasApproxFunc() || !ST->hasIEEEDivSqrt());
+  GenXIntrinsic::ID SqrtID =
+      IsFast ? GenXIntrinsic::genx_sqrt : GenXIntrinsic::genx_ieee_sqrt;
 
   auto *SqrtDecl =
       GenXIntrinsic::getGenXDeclaration(CI->getModule(), SqrtID, {ResTy});
@@ -5576,11 +5636,23 @@ bool GenXLowering::lowerFMulAdd(CallInst *CI) {
   return true;
 }
 
-bool GenXLowering::lowerFAbs(CallInst *CI) {
+bool GenXLowering::lowerAbs(CallInst *CI) {
   IGC_ASSERT(CI);
-  auto *Decl = GenXIntrinsic::getGenXDeclaration(
-      CI->getModule(), GenXIntrinsic::genx_absf, {CI->getType()});
+  // Initialize values to those for FP types and then overwrite in
+  // case we're actually dealing with integer abs.
   SmallVector<Value *, 2> Args{CI->args()};
+  GenXIntrinsic::ID AbsID = GenXIntrinsic::genx_absf;
+  Type *Ty = CI->getType();
+  if (Ty->isIntOrIntVectorTy()) {
+    AbsID = GenXIntrinsic::genx_absi;
+    // Compared to llvm.fabs, llvm.abs has an additional
+    // 'is_int_min_poison' argument. Drop that for genx.absi
+    Args.assign({CI->getArgOperand(0)});
+  } else
+    IGC_ASSERT_MESSAGE(
+        Ty->isFPOrFPVectorTy(), "Unexpected type of abs/fabs intrinsic");
+  auto *Decl = GenXIntrinsic::getGenXDeclaration(
+      CI->getModule(), AbsID, {Ty});
   IRBuilder<> Builder{CI};
   auto *Res = Builder.CreateCall(Decl, Args, CI->getName());
   CI->replaceAllUsesWith(Res);
@@ -5743,7 +5815,7 @@ bool GenXLowering::widenByteOp(Instruction *Inst) {
   // Get the range of operands to process.
   unsigned StartIdx = 0, EndIdx = Inst->getNumOperands();
   if (auto CI = dyn_cast<CallInst>(Inst))
-    EndIdx = CI->getNumArgOperands();
+    EndIdx = IGCLLVM::getNumArgOperands(CI);
   else if (isa<SelectInst>(Inst))
     StartIdx = 1;
   // Extend the operands.

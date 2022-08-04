@@ -10,6 +10,7 @@ SPDX-License-Identifier: MIT
 #include "Types.hpp"
 #include "Checker/IRChecker.hpp"
 #include "../Frontend/Formatter.hpp"
+#include "../IR/Messages.hpp"
 
 #include <sstream>
 
@@ -175,6 +176,9 @@ SWSB::InstType Instruction::getSWSBInstType(SWSB_ENCODE_MODE mode) const {
     if (is(Op::MATH))
         return SWSB::InstType::MATH;
 
+    // instruction with any of operand type is DF belongs to Math pipe
+    if (mode == SWSB_ENCODE_MODE::ThreeDistPipeDPMath && isDF())
+        return SWSB::InstType::MATH;
 
     if (getOpSpec().isDpasFamily()) {
         return SWSB::InstType::DPAS;
@@ -208,6 +212,12 @@ bool Instruction::isMovWithLabel() const {
         getSource(0).getKind() == Operand::Kind::LABEL);
 }
 
+
+void Instruction::setInlineBinary(const Instruction::InlineBinaryType& binary) {
+
+    m_inlineBinary = binary;
+    m_isInlineBinaryInst = true;
+}
 
 void Instruction::validate() const
 {

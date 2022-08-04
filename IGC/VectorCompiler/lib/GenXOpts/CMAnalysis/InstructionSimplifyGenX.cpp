@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2022 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -12,8 +12,6 @@ SPDX-License-Identifier: MIT
 // are constant; the constant operand cases are handled in ConstantFoldGenX.cpp.
 //
 //===----------------------------------------------------------------------===//
-
-#define DEBUG_TYPE "genx-simplify"
 
 #include "llvmWrapper/Analysis/CallGraph.h"
 #include "llvmWrapper/IR/CallSite.h"
@@ -43,6 +41,8 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/DerivedTypes.h"
 
 #include "Probe/Assertion.h"
+
+#define DEBUG_TYPE "genx-simplify"
 
 using namespace llvm;
 
@@ -195,7 +195,7 @@ static bool isWriteWithUndefInput(const Instruction &Inst) {
     return isa<UndefValue>(
         Inst.getOperand(GenXIntrinsic::GenXRegion::NewValueOperandNum));
   case GenXIntrinsic::genx_wrpredregion:
-    return isa<UndefValue>(Inst.getOperand(WrPredRegionOperand::NewValue));
+    return isa<UndefValue>(Inst.getOperand(vc::WrPredRegionOperand::NewValue));
   }
 }
 
@@ -207,7 +207,7 @@ static Value &getWriteOldValueOperand(Instruction &Inst) {
   case GenXIntrinsic::genx_wrregionf:
     return *Inst.getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum);
   case GenXIntrinsic::genx_wrpredregion:
-    return *Inst.getOperand(WrPredRegionOperand::OldValue);
+    return *Inst.getOperand(vc::WrPredRegionOperand::OldValue);
   }
 }
 
@@ -393,7 +393,7 @@ Value *llvm::SimplifyGenX(CallInst *I, const DataLayout &DL) {
   Value *V = IGCLLVM::getCalledValue(I);
   Type *Ty = V->getType();
   if (auto *PTy = dyn_cast<PointerType>(Ty))
-    Ty = PTy->getElementType();
+    Ty = PTy->getPointerElementType();
   auto *FTy = cast<FunctionType>(Ty);
   auto *F = dyn_cast<Function>(V);
   if (!F)
@@ -537,7 +537,7 @@ bool GenXSimplify::simplifyGenXLscAtomic(CallInst &CI,
 
   LLVM_DEBUG(dbgs() << "processing <lsc atomic>: " << CI << "\n");
 
-  if (!isa<UndefValue>(CI.getArgOperand(CI.getNumArgOperands() - 1))) {
+  if (!isa<UndefValue>(CI.getArgOperand(IGCLLVM::getNumArgOperands(&CI) - 1))) {
     LLVM_DEBUG(dbgs() << "  skipping as instruction already has some " <<
                "\"previous value\" set\n");
     return false;
@@ -597,7 +597,7 @@ bool GenXSimplify::simplifyGenXLscAtomic(CallInst &CI,
     LLVM_DEBUG(dbgs() << "previous value does not dominate candidate!\n");
     return false;
   }
-  CI.setArgOperand(CI.getNumArgOperands() - 1, PrevValue);
+  CI.setArgOperand(IGCLLVM::getNumArgOperands(&CI) - 1, PrevValue);
 
   Select->replaceAllUsesWith(&CI);
   Select->eraseFromParent();

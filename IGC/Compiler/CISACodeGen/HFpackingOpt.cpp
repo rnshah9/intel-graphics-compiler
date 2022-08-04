@@ -79,12 +79,14 @@ namespace {
     private:
         CodeGenContext* pContext = nullptr;
         ComputeShaderContext* csCtx = nullptr;
-        ModuleMetaData* modMD;
+        ModuleMetaData* modMD = nullptr;
         std::map<uint, uint> slmOffsetMap;
+        std::map<uint, uint> slmComponentsMap;
         std::map<uint, bool> HFList; // GEPoffset, HF flag
         std::map<uint32_t, uint32_t> HFpackedOffsets; // merged pair: GEP offset #1, GEP offset #2
         std::map<GetElementPtrInst*, Value *> HFpackedGEPs; // mapped old GEP to new GEP
-        bool bRemoveFromSlmMap;
+        bool bRemoveFromSlmMap = false;
+        bool bRemoveSlmGap = false;
 
         bool findSRVinfo(GenIntrinsicInst* tex, uint& runtimeV, uint& ptrAddrSpace);
         bool getSRVMap(GenIntrinsicInst* tex, uint& index);
@@ -98,9 +100,11 @@ namespace {
         bool findStoreSequence(std::vector<Instruction*>& path, std::vector< std::vector<Instruction*>>& allPath);
         bool adjGep(Value* gep0, Value* gep1, Value* gep2, uint32_t offset[3]);
         bool initializeSlmOffsetMap(Function& F);
+        void adjOffsetMap(uint32_t offset, uint32_t minusSize, const bool eraseGivenOffset);
         void removeFromSlmMap(GetElementPtrInst* gep);
         void updateSlmOffsetSize(Function& F);
-        bool canMergeGEPs(Instruction* inst1, Instruction* inst2);
+        void removeSlmGap(Function& F);
+        uint getGEPcomponent(GetElementPtrInst* GEP);
         bool canMerge(HFdata& prev, GetElementPtrInst* GEP,
             const uint arraySize, const uint elmBytes, const uint offset,
             const uint storePattern, const bool bStoreConstZero, bool &bRemoveSLM);
@@ -134,6 +138,7 @@ HFpackingOpt::HFpackingOpt() : FunctionPass(ID)
 {
     initializeHFpackingOptPass(*PassRegistry::getPassRegistry());
     bRemoveFromSlmMap = false;
+    bRemoveSlmGap = false;
 }
 
 // return runtimeV and ptrAddrSpace for the given GenISA_ldptr
@@ -190,38 +195,45 @@ bool HFpackingOpt::getSRVMap(GenIntrinsicInst* texld, uint& index)
     return false;
 }
 
-void HFpackingOpt::removeFromSlmMap(GetElementPtrInst* gep)
+void HFpackingOpt::adjOffsetMap(uint32_t offset, uint32_t minusSize, const bool eraseGivenOffset)
 {
-    uint32_t arraySize = 0, elmBytes = 0, offset = 0;
-    getGEPInfo(gep, arraySize, elmBytes, offset);
-
     auto slmOffsetIter = slmOffsetMap.begin();
     while (slmOffsetIter != slmOffsetMap.end())
     {
         // already removed
-        if (slmOffsetIter->second == -1)
-        {
-            ;
-        }
-        // find the offset to be removed
-        else if (slmOffsetIter->first == offset)
+        if ( !(slmOffsetIter->second == -1)  &&
+            // find the offset to be removed
+            (slmOffsetIter->first == offset) )
         {
             bRemoveFromSlmMap = true;
-            slmOffsetMap[slmOffsetIter->first] = -1;
-            csCtx->m_tgsmSize -= arraySize * elmBytes;;
+            if (eraseGivenOffset)
+            {
+                slmOffsetMap[slmOffsetIter->first] = -1;
+            }
+            csCtx->m_tgsmSize -= minusSize;
 
             // update the higher offsets
             slmOffsetIter++;
             while (slmOffsetIter != slmOffsetMap.end())
             {
                 if (slmOffsetIter->second != -1)
-                    slmOffsetMap[slmOffsetIter->first] -= (arraySize * elmBytes);
+                {
+                    IGC_ASSERT(slmOffsetMap[slmOffsetIter->first] >= minusSize);
+                    slmOffsetMap[slmOffsetIter->first] -= minusSize;
+                }
                 slmOffsetIter++;
             }
             break;
         }
         slmOffsetIter++;
     }
+}
+
+void HFpackingOpt::removeFromSlmMap(GetElementPtrInst* gep)
+{
+    uint32_t arraySize = 0, elmBytes = 0, offset = 0;
+    getGEPInfo(gep, arraySize, elmBytes, offset);
+    adjOffsetMap(offset, arraySize * elmBytes, true);
 }
 
 // detect if the given resource supports half float
@@ -386,31 +398,33 @@ ExtractElementInst* HFpackingOpt::decodeStore(StoreInst* pStore, bool& bStoreCon
     return EE;
 }
 
-// Two GEPs with the same offset (5184) can be merged if the indices are off by 1
+// GEP component 0
 // %79 = shl i32 % 78, 2
 // %80 = getelementptr[1296 x float], [1296 x float] addrspace(3) *
 //       inttoptr(i32 5184 to[1296 x float] addrspace(3)*), i32 0, i32 % 79
+//
+// GEP component 1
 // %81 = or i32 % 79, 1
 // %82 = getelementptr[1296 x float], [1296 x float] addrspace(3) *
 //       inttoptr(i32 5184 to[1296 x float] addrspace(3)*), i32 0, i32 % 81
-bool HFpackingOpt::canMergeGEPs(Instruction* inst1, Instruction* inst2)
+
+uint HFpackingOpt::getGEPcomponent(GetElementPtrInst* GEP)
 {
-    if (!inst1 || !inst2)
-        return false;
+    if (!GEP)
+        return 0;
 
-    uint addr1 = 0, addr2 = 0;
-    if (inst1->getOpcode() == Instruction::Or)
+    if (Instruction* inst = dyn_cast<Instruction>(GEP->getOperand(2)))
     {
-        const ConstantInt* CI = dyn_cast<ConstantInt>(inst1->getOperand(1));
-        addr1 = (uint)CI->getZExtValue();
+        if (inst->getOpcode() == Instruction::Or ||
+            inst->getOpcode() == Instruction::Add)
+        {
+            if (ConstantInt* CI = dyn_cast<ConstantInt>(inst->getOperand(1)))
+            {
+                return (uint)CI->getZExtValue();
+            }
+        }
     }
-    if (inst2->getOpcode() == Instruction::Or)
-    {
-        const ConstantInt* CI = dyn_cast<ConstantInt>(inst2->getOperand(1));
-        addr2 = (uint)CI->getZExtValue();
-    }
-
-    return (addr2 == addr1 + 1);
+    return 0;
 }
 
 bool HFpackingOpt::canMerge(HFdata& prev, GetElementPtrInst* GEP,
@@ -474,11 +488,11 @@ bool HFpackingOpt::canMerge(HFdata& prev, GetElementPtrInst* GEP,
             inttoptr(i32 5184 to[1296 x float] addrspace(3)*), i32 0, i32 %81
       */
     if ((offset == prev.offset) &&
-        (GEP->getOperand(2) != prev.GEP->getOperand(2)) &&
-        canMergeGEPs(dyn_cast<Instruction>(prev.GEP->getOperand(2)),
-                 dyn_cast<Instruction>(GEP->getOperand(2))))
+        (GEP->getOperand(2) != prev.GEP->getOperand(2)))
     {
-        return true;
+        uint comp1 = getGEPcomponent(prev.GEP);
+        uint comp2 = getGEPcomponent(GEP);
+        return (comp2 == comp1 + 1);
     }
 
     return false;
@@ -497,7 +511,7 @@ void HFpackingOpt::replaceStores(Instruction* startInst, Value* newGEP,
     }
     else
     {
-        Value* new1, * new2;
+        Value* new1 = nullptr, * new2 = nullptr;
         Function* f32tof16 = GenISAIntrinsic::getDeclaration(startInst->getModule(),
             GenISAIntrinsic::GenISA_f32tof16_rtz);
         new1 = builder.CreateCall(f32tof16, Store1->getOperand(0));
@@ -516,7 +530,7 @@ void HFpackingOpt::replaceLoads(Instruction *startInst, Value* newGEP,
     LoadInst *load1, LoadInst *load2)
 {
     IRBuilder<> builder(startInst);
-    Value* new1, * new2;
+    Value* new1 = nullptr, * new2 = nullptr;
 
     new1 = builder.CreateAlignedLoad(builder.getInt32Ty(), newGEP,
         getLoadStoreAlignment(load1));
@@ -532,9 +546,7 @@ void HFpackingOpt::replaceLoads(Instruction *startInst, Value* newGEP,
 // Checked if these two offsets are tracked by merged HF folding offsets
 bool HFpackingOpt::isPacked(uint offset1, uint offset2)
 {
-    std::map<uint32_t, uint32_t>::iterator it;
-
-    it = HFpackedOffsets.find(offset1);
+    std::map<uint32_t, uint32_t>::iterator it = HFpackedOffsets.find(offset1);
     if (it != HFpackedOffsets.end() && offset2 == it->second)
     {
         return true;
@@ -582,7 +594,7 @@ void HFpackingOpt::PackHfResources(Function& F)
                     continue;
                 }
 
-                uint arraySize, elmBytes, offset;
+                uint arraySize = 0, elmBytes = 0, offset = 0;
                 GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(Store->getOperand(1));
                 if (!GEP || !getGEPInfo(GEP, arraySize, elmBytes, offset))
                     continue;
@@ -612,11 +624,14 @@ void HFpackingOpt::PackHfResources(Function& F)
                 auto inst = GEP;
                 IRBuilder<> builder(inst);
 
-                Value* Int2Ptr = builder.CreateIntToPtr(builder.getInt32(prevStore.offset),
-                    PointerType::get(ArrayType::get(builder.getInt32Ty(), prevStore.arraySize),
-                        ADDRESS_SPACE_LOCAL));
+                auto* PointeeTy = ArrayType::get(builder.getInt32Ty(), prevStore.arraySize);
+
+                Value* Int2Ptr = builder.CreateIntToPtr(
+                    builder.getInt32(prevStore.offset),
+                    PointerType::get(PointeeTy, ADDRESS_SPACE_LOCAL));
+
                 Value* gepArg[] = { prevStore.GEP->getOperand(1), prevStore.GEP->getOperand(2) };
-                Value* newGEP = builder.CreateGEP(nullptr, Int2Ptr, gepArg);
+                Value* newGEP = builder.CreateGEP(PointeeTy, Int2Ptr, gepArg);
 
                 replaceStores(GEP, newGEP, prevStore.Store, Store,
                     prevStore.bStoreConstZero, bStoreConstZero);
@@ -624,6 +639,10 @@ void HFpackingOpt::PackHfResources(Function& F)
                 // track the GEP offset of the merged stores for quick lookup later
                 HFpackedOffsets[prevStore.offset] = offset;
                 HFpackedGEPs[prevStore.GEP] = newGEP;
+                if (prevStore.offset == offset)
+                {
+                    bRemoveSlmGap = true;
+                }
 
                 RemoveInst.push_back(prevStore.Store);
                 RemoveInst.push_back(Store);
@@ -654,7 +673,7 @@ void HFpackingOpt::PackHfResources(Function& F)
                     continue;
                 }
 
-                uint arraySize, elmBytes, offset;
+                uint arraySize = 0, elmBytes = 0, offset = 0;
                 GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(Load->getOperand(0));
                 if (!GEP || !getGEPInfo(GEP, arraySize, elmBytes, offset))
                     continue;
@@ -674,8 +693,8 @@ void HFpackingOpt::PackHfResources(Function& F)
                     continue;
                 }
 
-                Value* newGEP;
-                Instruction* startInst;
+                Value* newGEP = nullptr;
+                Instruction* startInst = nullptr;
                 std::map<GetElementPtrInst*, Value*>::iterator iGEP;
                 iGEP = HFpackedGEPs.find(prevLoad.GEP);
                 if (iGEP != HFpackedGEPs.end())
@@ -689,10 +708,14 @@ void HFpackingOpt::PackHfResources(Function& F)
                     startInst = GEP;
                     IRBuilder<> builder(startInst);
 
-                    Value* Int2Ptr = builder.CreateIntToPtr(builder.getInt32(prevLoad.offset),
-                        PointerType::get(ArrayType::get(builder.getInt32Ty(), prevLoad.arraySize), ADDRESS_SPACE_LOCAL));
+                    auto* PointeeTy = ArrayType::get(builder.getInt32Ty(), prevLoad.arraySize);
+
+                    Value* Int2Ptr = builder.CreateIntToPtr(
+                        builder.getInt32(prevLoad.offset),
+                        PointerType::get(PointeeTy, ADDRESS_SPACE_LOCAL));
+
                     Value* gepArg[] = { prevLoad.GEP->getOperand(1), prevLoad.GEP->getOperand(2) };
-                    newGEP = builder.CreateGEP(nullptr, Int2Ptr, gepArg);
+                    newGEP = builder.CreateGEP(PointeeTy, Int2Ptr, gepArg);
                 }
 
                 replaceLoads(startInst, newGEP, prevLoad.Load, Load);
@@ -809,7 +832,7 @@ bool HFpackingOpt::findStoreSequence(std::vector<Instruction*>& path, std::vecto
         uint srciCount = inst->getNumOperands();
         if (CallInst* cinst = dyn_cast<CallInst>(inst))
         {
-            srciCount = cinst->getNumArgOperands();
+            srciCount = IGCLLVM::getNumArgOperands(cinst);
         }
 
         for (uint srci = 0; srci < srciCount; srci++)
@@ -1037,7 +1060,7 @@ void HFpackingOpt::removeRedundantChannels(Function& F)
     if (storeGepToRemove.size() == 0)
         return;
 
-    GetElementPtrInst* removeGEP;
+    GetElementPtrInst* removeGEP = nullptr;
     // start removing load/store/gep
     for (auto iter = storeGepToRemove.begin(); iter != storeGepToRemove.end(); iter++)
     {
@@ -1109,6 +1132,13 @@ bool HFpackingOpt::initializeSlmOffsetMap(Function& F)
                     if (getGEPInfo(GEP, arraySize, elmBytes, offset))
                     {
                         slmOffsetMap[offset] = offset;
+
+                        uint comp = getGEPcomponent(GEP);
+                        if (slmComponentsMap.find(offset) == slmComponentsMap.end() ||
+                            slmComponentsMap[offset] < comp)
+                        {
+                            slmComponentsMap[offset] = comp;
+                        }
                     }
                     else
                     {
@@ -1151,6 +1181,80 @@ void HFpackingOpt::updateSlmOffsetSize(Function& F)
     csCtx->m_slmSize = iSTD::RoundPower2(DWORD(csCtx->m_tgsmSize));
 }
 
+// If GEP @5184 is 4-component array, we can reduce SLM footprint by half after packing them in pairs
+// Before
+// %200 = getelementptr[972 x float], [972 x float] addrspace(3) * inttoptr(i32 1296 to .....
+// %300 = getelementptr[1296x float], [1296x float] addrspace(3) * inttoptr(i32 5184 to .....
+// %400 = getelementptr[486 x float], [486 x float] addrspace(3) * inttoptr(i32 10368 to .....
+// After
+// %200 = getelementptr[972 x float], [972 x float] addrspace(3) * inttoptr(i32 1296 to .....
+// %300 = getelementptr[648 x float], [648 x float] addrspace(3) * inttoptr(i32 5184 to .....
+// %400 = getelementptr[486 x float], [486 x float] addrspace(3) * inttoptr(i32 7776 to .....
+void HFpackingOpt::removeSlmGap(Function& F)
+{
+    uint32_t arraySize = 0, elmBytes = 0, offset = 0;
+    std::map<uint, uint> savedSlmSpace;
+    std::vector<GetElementPtrInst*> RemoveGEPs;
+
+    if (!bRemoveSlmGap)
+        return;
+
+    for (BasicBlock& bb : F)
+    {
+        for (Instruction& ii : bb)
+        {
+            if (GetElementPtrInst* GEP = llvm::dyn_cast<GetElementPtrInst>(&(ii)))
+            {
+                if (GEP->getPointerAddressSpace() == ADDRESS_SPACE_LOCAL &&
+                    getGEPInfo(GEP, arraySize, elmBytes, offset))
+                {
+                    if (HFpackedOffsets.find(offset) == HFpackedOffsets.end())
+                        continue;
+                    else if (HFpackedOffsets[offset] != offset)
+                        continue;
+
+                    if (slmComponentsMap.find(offset) != slmComponentsMap.end() &&
+                        slmComponentsMap[offset] == 3) // 4-component SLM
+                    {
+                        if (savedSlmSpace.find(offset) == savedSlmSpace.end())
+                        {
+                            // cut down SLM space by half
+                            // saving (arraySize/2) entries, or 2*arraySize bytes
+                            savedSlmSpace[offset] = arraySize << 1; // 2*arraySize
+                        }
+                        IRBuilder<> builder(GEP);
+
+                        auto* PointeeTy = ArrayType::get(builder.getInt32Ty(), arraySize >> 1);
+
+                        Value* Int2Ptr = builder.CreateIntToPtr(
+                            builder.getInt32(offset),
+                            PointerType::get(PointeeTy, ADDRESS_SPACE_LOCAL));
+
+                        Value* div2 = builder.CreateLShr(GEP->getOperand(2), builder.getInt32(1));
+                        Value* gepArg[] = { GEP->getOperand(1), div2 };
+                        Value* newGEP = builder.CreateGEP(PointeeTy, Int2Ptr, gepArg);
+                        GEP->replaceAllUsesWith(newGEP);
+
+                        if (GEP->use_empty())
+                            RemoveGEPs.push_back(GEP);
+                    }
+                }
+            }
+        }
+    }
+
+    for (std::map<uint, uint>::iterator it = savedSlmSpace.begin();
+        it != savedSlmSpace.end(); ++it)
+    {
+        adjOffsetMap(it->first, it->second, false);
+    }
+
+    for (size_t i = 0; i < RemoveGEPs.size(); i++)
+        RemoveGEPs[i]->eraseFromParent();
+
+    csCtx->m_slmSize = iSTD::RoundPower2(DWORD(csCtx->m_tgsmSize));
+}
+
 bool HFpackingOpt::runOnFunction(Function& F)
 {
     pContext = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
@@ -1173,6 +1277,7 @@ bool HFpackingOpt::runOnFunction(Function& F)
     }
 
     // update slm offsets and size
+    removeSlmGap(F);
     updateSlmOffsetSize(F);
 
     return false;

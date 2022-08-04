@@ -26,7 +26,6 @@ static const unsigned PRESSURE_REDUCTION_THRESHOLD = 110;
 static const unsigned PRESSURE_HIGH_THRESHOLD = 128;
 static const unsigned PRESSURE_LOW_THRESHOLD = 60;
 static const unsigned PRESSURE_REDUCTION_THRESHOLD_SIMD32 = 120;
-static const unsigned LATENCY_PRESSURE_THRESHOLD = 100;
 
 namespace {
 
@@ -38,6 +37,7 @@ public:
     preEdge(preNode* N, DepType Ty)
         : mNode(N)
         , mType(Ty)
+        , mLatency(-1)
     {
     }
 
@@ -59,12 +59,23 @@ public:
         return false;
     }
 
+    void setLatency(int L) { mLatency = L; }
+    int  getLatency()
+    {
+        return isDataDep() ? mLatency : 0;
+    }
+
 private:
     // Node at the end of this edge.
     preNode* mNode;
 
     // Type of dependence (RAW, WAW, WAR, etc.).
     DepType mType;
+
+    // data-dependence Latency used in Latency scheduling.
+    // only exists (i.e. >=0) on succ-edge during latency scheduling.
+    // set in LatencyQueue::calculatePriority
+    int mLatency;
 };
 
 class preNode {
@@ -139,9 +150,13 @@ public:
             return TupleParts;
         return TupleLead->TupleParts;
     }
-
+    // Used in latency scheduling
+    void setReadyCycle(unsigned cyc) { ReadyCycle = cyc; }
+    unsigned getReadyCycle() { return ReadyCycle; }
+    // Used in ACC scheduling
     void setACCCandidate() { ACCCandidate = true; }
     bool isACCCandidate() { return ACCCandidate; }
+
     void print(std::ostream& os) const;
     void dump() const;
 
@@ -170,6 +185,9 @@ private:
 
     // # of succs not scheduled.
     unsigned NumSuccsLeft = 0;
+
+    // the earliest cycle for latency scheduling
+    unsigned ReadyCycle = 0;
 
     // True once scheduled.
     bool isScheduled = false;
@@ -433,17 +451,23 @@ struct SchedConfig
         MASK_LATENCY      = 1U << 1,
         MASK_SETHI_ULLMAN = 1U << 2,
         MASK_CLUSTTERING  = 1U << 3,
+        MASK_SKIP_HOLD    = 1U << 4,
+        MASK_NOT_ITERATE  = 1U << 5,
     };
     unsigned Dump : 1;
     unsigned UseLatency : 1;
     unsigned UseSethiUllman : 1;
     unsigned DoClustering : 1;
+    unsigned SkipHoldList : 1;   // default 0 i.e. use hold list in latency-hiding
+    unsigned DoNotIterate : 1;   // default 0 i.e. iterative latency-scheduling
 
     explicit SchedConfig(unsigned Config)
         : Dump((Config & MASK_DUMP) != 0)
         , UseLatency((Config & MASK_LATENCY) != 0)
         , UseSethiUllman((Config & MASK_SETHI_ULLMAN) != 0)
         , DoClustering((Config & MASK_CLUSTTERING) != 0)
+        , SkipHoldList((Config & MASK_SKIP_HOLD) != 0)
+        , DoNotIterate((Config & MASK_NOT_ITERATE) != 0)
     {
     }
 };
@@ -491,26 +515,22 @@ public:
     G4_Kernel& getKernel() const { return kernel; }
     G4_BB* getBB() const { return ddd.getBB(); }
 
-    // Run list scheduling.
-    void scheduleBlockForPressure(bool ForceClustering = false) {
-        auto SaveClustering = config.DoClustering;
-        if (ForceClustering)
-            config.DoClustering = 1;
-        SethiUllmanScheduling();
-        config.DoClustering = SaveClustering;
-    }
-    void scheduleBlockForLatency() { LatencyScheduling(); }
+    // MaxPressure is the BB pressure before and after scheduling
+    bool scheduleBlockForPressure(unsigned& MaxPressure, unsigned Threshold);
 
-    // Commit this scheduling if it reduces register pressure.
-    bool commitIfBeneficial(unsigned &MaxRPE, bool IsTopDown);
+    // MaxPressure is the BB pressure before and after scheduling
+    // ReassignID of PreNodes when this is not 1st-round scheduling
+    bool scheduleBlockForLatency(unsigned& MaxPressure, bool ReassignID);
 
 private:
     void SethiUllmanScheduling();
-    void LatencyScheduling();
+    void LatencyScheduling(unsigned GroupingThreshold);
     bool verifyScheduling();
 
     // Relocate pseudo-kills right before its successors.
     void relocatePseudoKills();
+    // Commit this scheduling if it reduces register pressure.
+    bool commitIfBeneficial(unsigned& MaxRPE, bool IsTopDown);
 };
 
 
@@ -556,14 +576,14 @@ static unsigned getRPThresholdLow(unsigned NumGrfs, unsigned simdSize)
 
 static unsigned getLatencyHidingThreshold(G4_Kernel &kernel)
 {
-    unsigned RPThreshold = kernel.getOptions()->getuInt32Option(vISA_preRA_ScheduleRPThreshold);
-    if (RPThreshold > 0)
-    {
-        return unsigned(RPThreshold);
-    }
     unsigned NumGrfs = kernel.getNumRegTotal();
     float Ratio = NumGrfs / 128.0f;
-    return unsigned(LATENCY_PRESSURE_THRESHOLD * Ratio);
+    unsigned RPThreshold = kernel.getOptions()->getuInt32Option(vISA_preRA_ScheduleRPThreshold);
+    if (RPThreshold == 0)
+    {
+        RPThreshold = 104;
+    }
+    return unsigned(RPThreshold * Ratio);
 }
 
 preRA_Scheduler::preRA_Scheduler(G4_Kernel& k, Mem_Manager& m, RPE* rpe)
@@ -626,68 +646,8 @@ bool preRA_Scheduler::run()
         preDDD ddd(mem, kernel, bb);
         BB_Scheduler S(kernel, ddd, rp, config, LT);
 
-        auto tryRPReduction = [=]() {
-            if (!config.UseSethiUllman)
-                 return false;
-            return MaxPressure >= Threshold;
-        };
-
-        if (tryRPReduction()) {
-            ddd.buildGraph();
-            S.scheduleBlockForPressure();
-            if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ false)) {
-                SCHED_DUMP(rp.dump(bb, "After scheduling for presssure, "));
-                Changed = true;
-                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
-                                                              this->kernel.getSimdSize());
-            }
-            else if (!config.DoClustering && !isSlicedSIMD32(ddd.getKernel()))
-            {   // try clustering
-                ddd.reset(false);
-                S.scheduleBlockForPressure(true);
-                if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ false))
-                {
-                    SCHED_DUMP(rp.dump(bb, "After scheduling for presssure, "));
-                    Changed = true;
-                    kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
-                        this->kernel.getSimdSize());
-                }
-            }
-        }
-
-        auto tryLatencyHiding = [=]() {
-            if (!config.UseLatency)
-                return false;
-
-            if (MaxPressure >= getLatencyHidingThreshold(kernel))
-                return false;
-
-            // simple ROI check.
-            unsigned NumOfHighLatencyInsts = 0;
-            for (auto Inst : *bb) {
-                if (Inst->isSend()) {
-                    G4_SendDesc* MsgDesc = Inst->getMsgDesc();
-                    if (MsgDesc->isRead() ||
-                        MsgDesc->isSampler() ||
-                        MsgDesc->isAtomic())
-                        NumOfHighLatencyInsts++;
-                }
-            }
-
-            return NumOfHighLatencyInsts >= 2;
-        };
-
-        if (tryLatencyHiding()) {
-            ddd.reset(Changed);
-            S.scheduleBlockForLatency();
-            if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ true)) {
-                SCHED_DUMP(rp.dump(bb, "After scheduling for latency, "));
-                Changed = true;
-                bb->setLatencySched(true);
-                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForLatency",
-                                                              this->kernel.getSimdSize());
-            }
-        }
+        Changed |= S.scheduleBlockForPressure(MaxPressure, Threshold);
+        Changed |= S.scheduleBlockForLatency(MaxPressure, Changed);
     }
 
     return Changed;
@@ -701,6 +661,7 @@ GRFMode::GRFMode(TARGET_PLATFORM platform)
     case Xe_DG2:
     case Xe_PVC:
     case Xe_PVCXT:
+    case Xe_MTL:
         configurations.resize(2);
         // Configurations for this platform <GRF, numThreads>
         configurations[0] = std::make_pair(128, 8);
@@ -777,10 +738,33 @@ bool preRA_RegSharing::run()
     // If maximum register pressure is higher than default GRF mode,
     // assign the smallest number of threads to this kernel.
     if (!kernel.getOptions()->getuInt32Option(vISA_ForceHWThreadNumberPerEU) &&
+        !kernel.getOptions()->getOption(vISA_MultiLevelRegSharing) &&
         (maxPressure > getRPThresholdHigh(kernel.getNumRegTotal() - kernel.getOptions()->getuInt32Option(vISA_ReservedGRFNum))))
     {
         // Update number of threads, GRF, Acc and SWSB
         kernel.updateKernelByNumThreads(GrfMode.getMinNumThreads());
+    }
+    else if (!kernel.getOptions()->getuInt32Option(vISA_ForceHWThreadNumberPerEU) &&
+        kernel.getOptions()->getOption(vISA_MultiLevelRegSharing))
+    {
+        if (maxPressure <= 64)
+            kernel.updateKernelByNumThreads(12);
+        else if (maxPressure <= 80)
+            kernel.updateKernelByNumThreads(10);
+        else if (maxPressure <= 96)
+            kernel.updateKernelByNumThreads(9);
+        else if (maxPressure <= 112)
+            kernel.updateKernelByNumThreads(8);
+        else if (maxPressure <= 128)
+            kernel.updateKernelByNumThreads(7);
+        else if (maxPressure <= 144)
+            kernel.updateKernelByNumThreads(6);
+        else if (maxPressure <= 160)
+            kernel.updateKernelByNumThreads(6);
+        else if (maxPressure <= 192)
+            kernel.updateKernelByNumThreads(5);
+        else
+            kernel.updateKernelByNumThreads(4);
     }
 
     unsigned Threshold = getRPReductionThreshold(kernel.getNumRegTotal(), isSlicedSIMD32(kernel));
@@ -822,75 +806,8 @@ bool preRA_RegSharing::run()
         preDDD ddd(mem, kernel, bb);
         BB_Scheduler S(kernel, ddd, rp, config, LT);
 
-        auto tryRPReduction = [=]()
-        {
-            if (!config.UseSethiUllman)
-                return false;
-            return MaxPressure >= Threshold;
-        };
-
-        if (tryRPReduction())
-        {
-            ddd.buildGraph();
-            S.scheduleBlockForPressure();
-            if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ false))
-            {
-                SCHED_DUMP(rp.dump(bb, "After scheduling for presssure, "));
-                changed = true;
-                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
-                    this->kernel.getSimdSize());
-            }
-            else if (!config.DoClustering && !isSlicedSIMD32(ddd.getKernel()))
-            {   // try clustering
-                ddd.reset(false);
-                S.scheduleBlockForPressure(true);
-                if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ false))
-                {
-                    SCHED_DUMP(rp.dump(bb, "After scheduling for presssure, "));
-                    changed = true;
-                    kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
-                        this->kernel.getSimdSize());
-                }
-            }
-        }
-
-        auto tryLatencyHiding = [=]()
-        {
-            if (!config.UseLatency)
-                return false;
-
-            if (MaxPressure >= getLatencyHidingThreshold(kernel))
-                return false;
-
-            // simple ROI check.
-            unsigned NumOfHighLatencyInsts = 0;
-            for (auto Inst : *bb)
-            {
-                if (Inst->isSend())
-                {
-                    G4_SendDesc* MsgDesc = Inst->getMsgDesc();
-                    if (MsgDesc->isRead() ||
-                        MsgDesc->isSampler() ||
-                        MsgDesc->isAtomic())
-                        NumOfHighLatencyInsts++;
-                }
-            }
-
-            return NumOfHighLatencyInsts >= 2;
-        };
-
-        if (tryLatencyHiding())
-        {
-            ddd.reset(changed);
-            S.scheduleBlockForLatency();
-            if (S.commitIfBeneficial(MaxPressure, /*IsTopDown*/ true))
-            {
-                SCHED_DUMP(rp.dump(bb, "After scheduling for latency, "));
-                changed = true;
-                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForLatency",
-                    this->kernel.getSimdSize());
-            }
-        }
+        changed |= S.scheduleBlockForPressure(MaxPressure, Threshold);
+        changed |= S.scheduleBlockForLatency(MaxPressure, changed);
     }
 
     return changed;
@@ -1317,6 +1234,43 @@ preNode* SethiUllmanQueue::select()
 
 // The basic idea is...
 //
+bool BB_Scheduler::scheduleBlockForPressure(unsigned& MaxPressure, unsigned Threshold)
+{
+    auto tryRPReduction = [=]() {
+        if (!config.UseSethiUllman)
+            return false;
+        return MaxPressure >= Threshold;
+    };
+
+    bool Changed = false;
+    if (tryRPReduction()) {
+        ddd.buildGraph();
+        SethiUllmanScheduling();
+        if (commitIfBeneficial(MaxPressure, /*IsTopDown*/ false)) {
+            SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for presssure, "));
+            Changed = true;
+            kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
+                this->kernel.getSimdSize());
+        }
+        else if (!config.DoClustering && !isSlicedSIMD32(ddd.getKernel()))
+        {   // try clustering
+            ddd.reset(false);
+            auto SaveClustering = config.DoClustering;
+            config.DoClustering = 1;
+            SethiUllmanScheduling();
+            config.DoClustering = SaveClustering;
+            if (commitIfBeneficial(MaxPressure, /*IsTopDown*/ false))
+            {
+                SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for presssure, "));
+                Changed = true;
+                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForPressure",
+                    this->kernel.getSimdSize());
+            }
+        }
+    }
+    return Changed;
+}
+
 void BB_Scheduler::SethiUllmanScheduling()
 {
     schedule.clear();
@@ -1368,25 +1322,35 @@ class LatencyQueue : public QueueBase {
     const LatencyTable &LT;
 
     // TODO: Try to apply priority queue to SethiUllmanQueue as well.
+
+    // nodes with all predecessors scheduled and ready-cycle <= current-cycle for topdown scheduling
     std::priority_queue<preNode*, std::vector<preNode*>, std::function<bool(preNode*, preNode*)>> ReadyList;
+    // nodes with all predecessors scheduled and ready-cycle > current-cycle for topdown scheduling
+    std::priority_queue<preNode*, std::vector<preNode*>, std::function<bool(preNode*, preNode*)>> HoldList;
+    // The register-pressure limit we use to decide sub-blocking
+    unsigned GroupingPressureLimit;
 
 public:
     LatencyQueue(preDDD& ddd, RegisterPressure& rp, SchedConfig config,
-        const LatencyTable& LT)
+        const LatencyTable& LT, unsigned GroupingThreshold)
         : QueueBase(ddd, rp, config)
         , LT(LT)
-        , ReadyList([this](preNode* a, preNode* b){ return compare(a, b);})
+        , ReadyList([this](preNode* a, preNode* b){ return compareReady(a, b);})
+        , HoldList([this](preNode* a, preNode* b) { return compareHold(a, b); })
+        , GroupingPressureLimit(GroupingThreshold)
     {
         init();
     }
 
-    // Add a new ready node.
+    // Add a new node to queue.
     void push(preNode* N) override
     {
         if (N->getInst() && N->getInst()->isPseudoKill())
             pseudoKills.push_back(N);
-        else
+        else if (config.SkipHoldList)
             ReadyList.push(N);
+        else
+            HoldList.push(N);
     }
 
     // Schedule the top node.
@@ -1409,13 +1373,63 @@ public:
         return pseudoKills.empty() && ReadyList.empty();
     }
 
+    // move instruction from HoldList to ReadyList,
+    // also update current-cycle and current-group
+    void advance(unsigned &CurCycle, unsigned& CurGroup)
+    {
+        if (config.SkipHoldList) {
+            assert(HoldList.empty());
+            // tracking cycle and group in this mode is only useful
+            // for understanding the scheduling result
+            if (!ReadyList.empty()) {
+                preNode* N = ReadyList.top();
+                CurCycle = std::max(CurCycle, N->getReadyCycle());
+                if (N->getInst())
+                    CurGroup = std::max(CurGroup, GroupInfo[N->getInst()]);
+            }
+            return;
+        }
+        GroupInfo[nullptr] = CurGroup;
+        // move inst out of hold-list based on current group and cycle
+        while (!HoldList.empty()) {
+            preNode* N = HoldList.top();
+            if (GroupInfo[N->getInst()] <= CurGroup &&
+                N->getReadyCycle() <= CurCycle) {
+                HoldList.pop();
+                ReadyList.push(N);
+            }
+            else
+                break;
+        }
+        // ready-list is still emtpy, then we need to move forward to
+        // the next group or the next cycle so that some instructions
+        // can come out of the hold-list.
+        if (ReadyList.empty() && !HoldList.empty()) {
+            preNode* N = HoldList.top();
+            CurCycle = std::max(CurCycle, N->getReadyCycle());
+            CurGroup = std::max(CurGroup, GroupInfo[N->getInst()]);
+            do {
+                preNode* N = HoldList.top();
+                if (GroupInfo[N->getInst()] <= CurGroup &&
+                    N->getReadyCycle() <= CurCycle) {
+                    HoldList.pop();
+                    ReadyList.push(N);
+                }
+                else
+                    break;
+            } while (!HoldList.empty());
+        }
+    }
+
 private:
     void init();
     unsigned calculatePriority(preNode *N);
 
     // Compare two ready nodes and decide which one should be scheduled first.
     // Return true if N2 has a higher priority than N1, false otherwise.
-    bool compare(preNode* N1, preNode* N2);
+    bool compareReady(preNode* N1, preNode* N2);
+
+    bool compareHold(preNode* N1, preNode* N2);
 
     // The ready pseudo kills.
     std::vector<preNode *> pseudoKills;
@@ -1423,29 +1437,95 @@ private:
 
 } // namespace
 
-// Scheduling block to hide latency (top down).
 //
-void BB_Scheduler::LatencyScheduling()
+bool BB_Scheduler::scheduleBlockForLatency(unsigned& MaxPressure, bool ReassignID)
+{
+    auto tryLatencyHiding = [=]() {
+        if (!config.UseLatency)
+            return false;
+
+        if (MaxPressure >= getLatencyHidingThreshold(kernel))
+            return false;
+
+        // simple ROI check.
+        unsigned NumOfHighLatencyInsts = 0;
+        for (auto Inst : *(ddd.getBB())) {
+            if (Inst->isSend()) {
+                G4_SendDesc* MsgDesc = Inst->getMsgDesc();
+                if (MsgDesc->isRead() ||
+                    MsgDesc->isSampler() ||
+                    MsgDesc->isAtomic())
+                    NumOfHighLatencyInsts++;
+            }
+        }
+
+        return NumOfHighLatencyInsts >= 2;
+    };
+
+    bool Changed = false;
+    if (tryLatencyHiding()) {
+        // try grouping-threshold decremently until we find a schedule likely won't spill
+        unsigned GTMax = 144;
+        unsigned GTMin = 96;
+        unsigned NumGrfs = kernel.getNumRegTotal();
+        float Ratio = NumGrfs / 128.0f;
+        // limit the iterative approach to certain platforms for now
+        if (config.DoNotIterate)
+        {
+            GTMax = GTMin = getLatencyHidingThreshold(kernel);
+            Ratio = 1.0f;  // already adjusted inside getLatencyHidingThreshold
+        }
+        for (unsigned GroupingThreshold = GTMax; GroupingThreshold >= GTMin;
+             GroupingThreshold = GroupingThreshold - 16)
+        {
+            ddd.reset(ReassignID);
+            LatencyScheduling(unsigned(GroupingThreshold * Ratio));
+            if (commitIfBeneficial(MaxPressure, /*IsTopDown*/ true)) {
+                SCHED_DUMP(rp.dump(ddd.getBB(), "After scheduling for latency, "));
+                Changed = true;
+                ddd.getBB()->setLatencySched(true);
+                kernel.fg.builder->getcompilerStats().SetFlag("PreRASchedulerForLatency",
+                    this->kernel.getSimdSize());
+                break;
+            }
+        }
+    }
+    return Changed;
+}
+
+// Scheduling block to hide latency (top down).
+void BB_Scheduler::LatencyScheduling(unsigned GroupingThreshold)
 {
     schedule.clear();
-    LatencyQueue Q(ddd, rp, config, LT);
+    LatencyQueue Q(ddd, rp, config, LT, GroupingThreshold);
     Q.push(ddd.getEntryNode());
 
+    unsigned CurrentCycle = 0;
+    unsigned CurrentGroup = 0;
+    Q.advance(CurrentCycle, CurrentGroup);
     while (!Q.empty()) {
         preNode *N = Q.pop();
         assert(N->NumPredsLeft == 0);
+        unsigned NextCycle = CurrentCycle;
         if (N->getInst() != nullptr) {
             schedule.push_back(N->getInst());
-            N->isScheduled = true;
+            NextCycle += LT.getOccupancy(N->getInst());
         }
-
+        N->isScheduled = true;
         for (auto I = N->succ_begin(), E = N->succ_end(); I != E; ++I) {
             preNode *Node = I->getNode();
             assert(!Node->isScheduled && Node->NumPredsLeft);
+            int L = (*I).getLatency();
+            assert(L >= 0);
+            if (Node->getReadyCycle() < CurrentCycle + (unsigned)L)
+                Node->setReadyCycle(CurrentCycle + (unsigned)L);
             --Node->NumPredsLeft;
-            if (Node->NumPredsLeft == 0)
+            if (Node->NumPredsLeft == 0) {
                 Q.push(Node);
+            }
         }
+        CurrentCycle = NextCycle;
+        Q.advance(CurrentCycle, CurrentGroup);
     }
 
     relocatePseudoKills();
@@ -1585,8 +1665,7 @@ void LatencyQueue::init()
         // and starts a new group.
         //
         std::vector<unsigned> Segments;
-        unsigned Threshold = getLatencyHidingThreshold(ddd.getKernel());
-        mergeSegments(RPtrace, Max, Min, Segments, Threshold);
+        mergeSegments(RPtrace, Max, Min, Segments, GroupingPressureLimit);
 
         // Iterate segments and assign a group id to each insstruction.
         unsigned i = 0;
@@ -1675,7 +1754,7 @@ unsigned LatencyQueue::calculatePriority(preNode* N)
                 break;
             }
         }
-
+        Edge.setLatency(Latency);
         Priority = std::max(Priority, SuccPriority + Latency);
     }
 
@@ -1684,12 +1763,18 @@ unsigned LatencyQueue::calculatePriority(preNode* N)
 
 // Compare two ready nodes and decide which one should be scheduled first.
 // Return true if N2 has a higher priority than N1, false otherwise.
-bool LatencyQueue::compare(preNode* N1, preNode* N2)
+bool LatencyQueue::compareReady(preNode* N1, preNode* N2)
 {
     assert(N1->getID() != N2->getID());
     assert(N1->getInst() && N2->getInst());
     assert(!N1->getInst()->isPseudoKill() &&
            !N2->getInst()->isPseudoKill());
+    auto isSendNoReturn = [](G4_INST* Inst)
+    {
+        if (Inst->isSend() && Inst->hasNULLDst())
+            return true;
+        return false;
+    };
 
     G4_INST* Inst1 = N1->getInst();
     G4_INST* Inst2 = N2->getInst();
@@ -1702,6 +1787,12 @@ bool LatencyQueue::compare(preNode* N1, preNode* N2)
     if (GID1 < GID2)
         return false;
 
+    // Favor sends without return such as stores or urb-writes
+    // because they likely release source registers
+    if (isSendNoReturn(Inst1) && !isSendNoReturn(Inst2))
+        return false;
+    else if (!isSendNoReturn(Inst1) && isSendNoReturn(Inst2))
+        return true;
     // Within the same group, compare their priority.
     unsigned P1 = Priorities[N1->getID()];
     unsigned P2 = Priorities[N2->getID()];
@@ -1715,6 +1806,37 @@ bool LatencyQueue::compare(preNode* N1, preNode* N2)
         return false;
     else if (!Inst1->isSend() && Inst2->isSend())
         return true;
+
+    // Otherwise, break tie on ID.
+    // Larger ID means higher priority.
+    return N2->getID() > N1->getID();
+}
+
+// hold-list is sorted by nodes' ready cycle
+bool LatencyQueue::compareHold(preNode* N1, preNode* N2)
+{
+    assert(N1->getID() != N2->getID());
+    assert(N1->getInst() && N2->getInst());
+    assert(!N1->getInst()->isPseudoKill() &&
+        !N2->getInst()->isPseudoKill());
+    G4_INST* Inst1 = N1->getInst();
+    G4_INST* Inst2 = N2->getInst();
+
+    // Group ID has higher priority, smaller ID means higher priority.
+    unsigned GID1 = GroupInfo[Inst1];
+    unsigned GID2 = GroupInfo[Inst2];
+    if (GID1 > GID2)
+        return true;
+    if (GID1 < GID2)
+        return false;
+
+    // compare ready cycle, smaller ready cycle means higher priority
+    unsigned cyc1 = N1->getReadyCycle();
+    unsigned cyc2 = N2->getReadyCycle();
+    if (cyc1 > cyc2)
+        return true;
+    if (cyc1 < cyc2)
+        return false;
 
     // Otherwise, break tie on ID.
     // Larger ID means higher priority.
@@ -1869,6 +1991,7 @@ bool BB_Scheduler::commitIfBeneficial(unsigned& MaxRPE, bool IsTopDown)
     SCHED_DUMP(rp.dump(getBB(), "schedule reverted, "));
     CurInsts.clear();
     CurInsts.splice(CurInsts.begin(), TempInsts, TempInsts.begin(), TempInsts.end());
+    rp.recompute(getBB());
     return false;
 }
 
@@ -2386,6 +2509,7 @@ void preDDD::reset(bool ReassignNodeID)
         N->NumPredsLeft = unsigned(N->Preds.size());
         N->NumSuccsLeft = unsigned(N->Succs.size());
         N->isScheduled = false;
+        N->setReadyCycle(0);
         N->isClustered = false;
         N->isClusterLead = false;
     }
@@ -2393,12 +2517,14 @@ void preDDD::reset(bool ReassignNodeID)
     EntryNode.NumPredsLeft = 0;
     EntryNode.NumSuccsLeft = unsigned(EntryNode.Succs.size());
     EntryNode.isScheduled = false;
+    EntryNode.setReadyCycle(0);
     EntryNode.isClustered = false;
     EntryNode.isClusterLead = false;
 
     ExitNode.NumPredsLeft = unsigned(ExitNode.Preds.size());
     ExitNode.NumSuccsLeft = 0;
     ExitNode.isScheduled = false;
+    ExitNode.setReadyCycle(0);
     ExitNode.isClustered = false;
     ExitNode.isClusterLead = false;
 }

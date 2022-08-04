@@ -49,11 +49,14 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/Local.h>
 #include <llvm/Pass.h>
 #include <llvm/IR/InstVisitor.h>
 #include <llvm/IR/PatternMatch.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/LoopPass.h>
+#include "llvm/IR/DebugInfo.h"
+#include "llvmWrapper/IR/IntrinsicInst.h"
 #include "common/LLVMWarningsPop.hpp"
 #include <set>
 #include "Probe/Assertion.h"
@@ -140,6 +143,15 @@ bool CustomUnsafeOptPass::runOnFunction(Function& F)
         iterCount++;
         m_isChanged = false;
         visit(F);
+
+        if (!m_instToDelete.empty())
+        {
+            for (auto i : m_instToDelete)
+            {
+                i->eraseFromParent();
+            }
+            m_instToDelete.clear();
+        }
     }
 
     // Do reassociate to emit more mad.
@@ -678,6 +690,64 @@ bool CustomUnsafeOptPass::visitBinaryOperatorExtractCommonMultiplier(BinaryOpera
     return patternFound;
 }
 
+// Searches for negation via xor instruction and replaces with subtraction.
+//
+// Example for float:
+//   %22 = bitcast float %a to i32
+//   %23 = xor i32 %22, -2147483648
+//   %24 = bitcast i32 %23 to float
+//
+// Will be changed to:
+//   %22 = fsub float 0.000000e+00, %a
+bool CustomUnsafeOptPass::visitBinaryOperatorXor(llvm::BinaryOperator& I)
+{
+    using namespace llvm::PatternMatch;
+
+    if (!I.hasOneUse())
+    {
+        return false;
+    }
+
+    Value* fpValue = nullptr;
+    ConstantInt* mask = nullptr;
+    if (!match(&I, m_Xor(m_OneUse(m_BitCast(m_Value(fpValue))), m_ConstantInt(mask))))
+    {
+        return false;
+    }
+
+    // bitcast before xor, from fp to int
+    uint32_t fpBits = fpValue->getType()->getScalarSizeInBits();
+    BitCastInst* castF2I = cast<BitCastInst>(I.getOperand(0));
+    if (!fpValue->getType()->isFloatingPointTy() || !castF2I->getType()->isIntegerTy(fpBits))
+    {
+        return false;
+    }
+
+    // bitcast after xor, back to fp
+    BitCastInst* castI2F = dyn_cast<BitCastInst>(*I.user_begin());
+    if (!castI2F || castI2F->getType() != fpValue->getType())
+    {
+        return false;
+    }
+
+    // mask replaces only one bit representing sign
+    uint64_t expectedMask = 1ll << (fpBits - 1);
+    if (!mask || mask->getBitWidth() != fpBits || mask->getZExtValue() != expectedMask)
+    {
+        return false;
+    }
+
+    IRBuilder<> builder(&I);
+    auto fsub = builder.CreateFSub(ConstantFP::get(fpValue->getType(), 0.0f), fpValue);
+
+    castI2F->replaceAllUsesWith(fsub);
+
+    m_instToDelete.push_back(castI2F);
+    m_instToDelete.push_back(&I);
+    m_instToDelete.push_back(castF2I);
+
+    return true;
+}
 
 bool CustomUnsafeOptPass::visitBinaryOperatorToFmad(BinaryOperator& I)
 {
@@ -1116,7 +1186,6 @@ bool CustomUnsafeOptPass::visitBinaryOperatorNegateMultiply(BinaryOperator& I)
                         newConstantFloat.changeSign();
                         Constant* newConstant = ConstantFP::get(fmulSrc->getContext(), newConstantFloat);
                         fmulSrc->setOperand(i, newConstant);
-                        I.replaceAllUsesWith(fmulInst);
                         replaced = true;
                         break;
                     }
@@ -1127,11 +1196,33 @@ bool CustomUnsafeOptPass::visitBinaryOperatorNegateMultiply(BinaryOperator& I)
             if (!replaced)
             {
                 fmulInst->setOperand(0, BinaryOperator::CreateFSub(ConstantFP::get(fmulInst->getType(), 0), fmulInst->getOperand(0), "", fmulInst));
-                I.replaceAllUsesWith(fmulInst);
+
+                // DIExpression in debug variable instructions must be extended with additional DWARF opcode:
+                // DW_OP_neg
+                Value* fsub = fmulInst->getOperand(0);
+                if (auto fsubInstr = dyn_cast<Instruction>(fsub)) {
+                    Value* fsubOp0 = fsubInstr->getOperand(1);
+                    if (auto fsubOp0Instr = dyn_cast<Instruction>(fsubOp0)) {
+                        if (Instruction* NewfmulInst = dyn_cast<Instruction>(fmulInst)) {
+                            const DebugLoc& DL = NewfmulInst->getDebugLoc();
+                            fsubInstr->setDebugLoc(DL);
+                            auto* Val = static_cast<Value*>(fmulInst);
+                            SmallVector<DbgValueInst*, 1> DbgValues;
+                            llvm::findDbgValues(DbgValues, Val);
+                            for (auto DV : DbgValues) {
+                                DIExpression* OldExpr = DV->getExpression();
+                                DIExpression* NewExpr = DIExpression::append(
+                                    OldExpr, { dwarf::DW_OP_constu, 0, dwarf::DW_OP_swap, dwarf::DW_OP_minus });
+                                IGCLLVM::setExpression(DV, NewExpr);
+                            }
+                        }
+                    }
+                }
             }
             ++Stat_FloatRemoved;
             m_isChanged = true;
             patternFound = true;
+            I.replaceAllUsesWith(fmulInst);
         }
     }
     return patternFound;
@@ -1367,6 +1458,10 @@ bool CustomUnsafeOptPass::visitBinaryOperatorAddDiv(BinaryOperator& I)
             if (faddInst->getOperand(i) == I.getOperand(1))
             {
                 Value* div = BinaryOperator::CreateFDiv(faddInst->getOperand(1 - i), I.getOperand(1), "", faddInst);
+                const DebugLoc& DL = faddInst->getDebugLoc();
+                if (Instruction* divInst = dyn_cast<Instruction>(div))
+                    divInst->setDebugLoc(DL);
+
                 Value* one = ConstantFP::get(I.getType(), 1.0);
 
                 if (faddInst->getOpcode() == Instruction::FAdd)
@@ -1753,6 +1848,10 @@ void CustomUnsafeOptPass::visitBinaryOperator(BinaryOperator& I)
             default:
                 break;
             }
+        }
+        else if (I.getOpcode() == Instruction::Xor)
+        {
+            m_isChanged = visitBinaryOperatorXor(I);
         }
     }
 }
@@ -2341,7 +2440,8 @@ void CustomUnsafeOptPass::reassociateMulAdd(Function& F)
     }
 
     auto modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
-    if (!modMD->compOpt.MadEnable)
+    if (!modMD->compOpt.MadEnable &&
+        !m_ctx->m_DriverInfo.RespectPerInstructionContractFlag())
     {
         return;
     }

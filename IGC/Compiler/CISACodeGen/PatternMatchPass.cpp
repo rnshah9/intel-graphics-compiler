@@ -310,6 +310,16 @@ namespace IGC
         return flushesDenorms;
     }
 
+    bool CodeGenPatternMatch::ContractionAllowed(llvm::Instruction& I) const
+    {
+        if (m_AllowContractions ||
+            (m_ctx->m_DriverInfo.RespectPerInstructionContractFlag() && I.hasAllowContract()))
+        {
+            return true;
+        }
+        return false;
+    }
+
     // this function need to be in sync with CShader::EvaluateSIMDConstExpr on what can be supported
     bool CodeGenPatternMatch::SIMDConstExpr(Instruction* C)
     {
@@ -1170,7 +1180,9 @@ namespace IGC
 
     void CodeGenPatternMatch::visitCmpInst(llvm::CmpInst& I)
     {
-        bool match = MatchCondModifier(I) ||
+        bool match =
+            MatchGenericPointersCmp(I) ||
+            MatchCondModifier(I) ||
             MatchModifier(I);
         IGC_ASSERT(match);
     }
@@ -1267,11 +1279,6 @@ namespace IGC
             case GenISAIntrinsic::GenISA_simdBlockRead:
             case GenISAIntrinsic::GenISA_simdBlockWrite:
                 match = MatchBlockReadWritePointer(*GII) ||
-                    MatchSingleInstruction(*GII);
-                break;
-            case GenISAIntrinsic::GenISA_URBRead:
-            case GenISAIntrinsic::GenISA_URBReadOutput:
-                match = MatchURBRead(*GII) ||
                     MatchSingleInstruction(*GII);
                 break;
             case GenISAIntrinsic::GenISA_UnmaskedRegionBegin:
@@ -2037,7 +2044,7 @@ namespace IGC
         e_modifier src_mod[2] = { e_modifier::EMOD_NONE, e_modifier::EMOD_NONE };
         e_modifier pred_mod = e_modifier::EMOD_NONE;
         bool invertPred = false;
-        if (m_AllowContractions == false || IGC_IS_FLAG_ENABLED(DisableMatchPredAdd))
+        if (!ContractionAllowed(I) || IGC_IS_FLAG_ENABLED(DisableMatchPredAdd))
         {
             return false;
         }
@@ -2061,7 +2068,7 @@ namespace IGC
             llvm::BinaryOperator* mul = llvm::dyn_cast<llvm::BinaryOperator>(src);
             if (mul && mul->getOpcode() == Instruction::FMul)
             {
-                if (!mul->hasOneUse())
+                if (!mul->hasOneUse() || !ContractionAllowed(*mul))
                 {
                     continue;
                 }
@@ -2514,76 +2521,6 @@ namespace IGC
         return false;
     }
 
-    // 1. Detect and handle immediate URB read offsets - these can be put in message descriptor.
-    // 2. Detect offsets of the form "add dst, var, imm" - here we can remove the add, putting imm in message descriptor,
-    // and var in message payload.
-    bool CodeGenPatternMatch::MatchURBRead(llvm::GenIntrinsicInst& I)
-    {
-        struct URBReadPattern : public Pattern
-        {
-            explicit URBReadPattern(GenIntrinsicInst* I, QuadEltUnit globalOffset, llvm::Value* const perSlotOffset) :
-                m_inst(I), m_globalOffset(globalOffset), m_perSlotOffset(perSlotOffset)
-            {}
-
-            virtual void Emit(EmitPass* pass, const DstModifier& modifier)
-            {
-                IGC_ASSERT(m_inst->getIntrinsicID() == GenISAIntrinsic::GenISA_URBRead ||
-                    m_inst->getIntrinsicID() == GenISAIntrinsic::GenISA_URBReadOutput);
-                pass->emitURBReadCommon(m_inst, m_globalOffset, m_perSlotOffset);
-            }
-
-        private:
-            GenIntrinsicInst* const m_inst;
-            const QuadEltUnit m_globalOffset;
-            llvm::Value* const m_perSlotOffset;
-        };
-
-        if (I.getIntrinsicID() != GenISAIntrinsic::GenISA_URBRead &&
-            I.getIntrinsicID() != GenISAIntrinsic::GenISA_URBReadOutput)
-        {
-            return false;
-        }
-
-        const bool hasVertexIndexAsArg0 = I.getIntrinsicID() == GenISAIntrinsic::GenISA_URBRead;
-        llvm::Value* const offset = I.getOperand(hasVertexIndexAsArg0 ? 1 : 0);
-        if (const ConstantInt * const constOffset = dyn_cast<ConstantInt>(offset))
-        {
-            const QuadEltUnit globalOffset = QuadEltUnit(int_cast<unsigned>(constOffset->getZExtValue()));
-            if (hasVertexIndexAsArg0)
-            {
-                MarkAsSource(I.getOperand(0));
-            }
-            URBReadPattern* pattern = new (m_allocator) URBReadPattern(&I, globalOffset, nullptr);
-            AddPattern(pattern);
-            return true;
-        }
-        else if (llvm::Instruction * const inst = llvm::dyn_cast<llvm::Instruction>(offset))
-        {
-            if (inst->getOpcode() == llvm::Instruction::Add)
-            {
-                const bool isConstant0 = llvm::isa<llvm::ConstantInt>(inst->getOperand(0));
-                const bool isConstant1 = llvm::isa<llvm::ConstantInt>(inst->getOperand(1));
-                if (isConstant0 || isConstant1)
-                {
-                    IGC_ASSERT_MESSAGE(!(isConstant0 && isConstant1), "Both operands are immediate - constants should be folded elsewhere.");
-
-                    if (hasVertexIndexAsArg0)
-                    {
-                        MarkAsSource(I.getOperand(0));
-                    }
-                    const QuadEltUnit globalOffset = QuadEltUnit(int_cast<unsigned>(cast<ConstantInt>(
-                        isConstant0 ? inst->getOperand(0) : inst->getOperand(1))->getZExtValue()));
-                    llvm::Value* const perSlotOffset = isConstant0 ? inst->getOperand(1) : inst->getOperand(0);
-                    MarkAsSource(perSlotOffset);
-                    URBReadPattern* pattern = new (m_allocator) URBReadPattern(&I, globalOffset, perSlotOffset);
-                    AddPattern(pattern);
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
 
     // Pattern matching to detect and handle immediate offsets in load/store
     // instructions.  It detects offsets of the form "add dst, var, imm"
@@ -2822,7 +2759,7 @@ namespace IGC
         llvm::Value* sources[3];
         e_modifier   src_mod[3];
 
-        if (m_AllowContractions == false)
+        if (!ContractionAllowed(I))
         {
             return false;
         }
@@ -2839,12 +2776,14 @@ namespace IGC
         for (uint i = 0; i < 2; i++)
         {
             llvm::BinaryOperator* mul = llvm::dyn_cast<llvm::BinaryOperator>(I.getOperand(i));
-            if (mul && mul->getOpcode() == Instruction::FMul)
+            if (mul &&
+                mul->getOpcode() == Instruction::FMul &&
+                ContractionAllowed(*mul))
             {
                 for (uint j = 0; j < 2; j++)
                 {
                     llvm::BinaryOperator* sub = llvm::dyn_cast<llvm::BinaryOperator>(mul->getOperand(j));
-                    if (sub)
+                    if (sub && ContractionAllowed(*sub))
                     {
                         llvm::ConstantFP* zero = llvm::dyn_cast<llvm::ConstantFP>(sub->getOperand(0));
                         if (zero && zero->isExactlyValue(0.f))
@@ -2893,7 +2832,9 @@ namespace IGC
             mul[0] = llvm::dyn_cast<llvm::BinaryOperator>(I.getOperand(0));
             mul[1] = llvm::dyn_cast<llvm::BinaryOperator>(I.getOperand(1));
             if (mul[0] && mul[0]->getOpcode() == Instruction::FMul &&
+                ContractionAllowed(*mul[0]) &&
                 mul[1] && mul[1]->getOpcode() == Instruction::FMul &&
+                ContractionAllowed(*mul[1]) &&
                 !llvm::isa<llvm::ConstantFP>(mul[0]->getOperand(0)) &&
                 !llvm::isa<llvm::ConstantFP>(mul[0]->getOperand(1)) &&
                 !llvm::isa<llvm::ConstantFP>(mul[1]->getOperand(0)) &&
@@ -2904,7 +2845,9 @@ namespace IGC
                     for (uint j = 0; j < 2; j++)
                     {
                         llvm::BinaryOperator* sub = llvm::dyn_cast<llvm::BinaryOperator>(mul[i]->getOperand(j));
-                        if (sub && sub->getOpcode() == Instruction::FSub)
+                        if (sub &&
+                            sub->getOpcode() == Instruction::FSub &&
+                            ContractionAllowed(*sub))
                         {
                             llvm::ConstantFP* one = llvm::dyn_cast<llvm::ConstantFP>(sub->getOperand(0));
                             if (one && one->isExactlyValue(1.f))
@@ -2979,7 +2922,10 @@ namespace IGC
                             uint k = 2 - casei;
 
                             //op[i] and op[j] should be fMul, and op[k] is src2
-                            if (op[i]->getOpcode() == Instruction::FMul && op[j]->getOpcode() == Instruction::FMul)
+                            if (op[i]->getOpcode() == Instruction::FMul &&
+                                op[j]->getOpcode() == Instruction::FMul &&
+                                ContractionAllowed(*op[i]) &&
+                                ContractionAllowed(*op[j]))
                             {
                                 for (uint srci = 0; srci < 2; srci++)
                                 {
@@ -3982,6 +3928,136 @@ namespace IGC
         return found;
     }
 
+    // When a NULL pointer is directly assigned to a generic pointer, then
+    // it doesn't have a pointer tag, so comparing it with NULL pointers that
+    // were firstly assigned to a named addrspace and then casted to a
+    // generic pointer may lead to incorrect comparison results.
+    //
+    // Example pseudo-code:
+    //  null_generic_ptr = NULL               ; <-- not tagged generic NULL pointer
+    //  local_ptr = NULL
+    //  generic_ptr = local_ptr               ; <-- local NULL pointer gets tagged while casting to generic pointer
+    //  if(generic_ptr == null_generic_ptr)   ; <-- comparing tagged generic pointer with not-tagged one
+    //
+    // Pointer tag should not be taken into account during generic pointer
+    // comparison, so the following pattern match detects generic pointers
+    // comparisons and triggers a special handling for them. The special handling
+    // relies on clearing tag bits right before pointers comparison.
+    //
+    // It matches the following patterns, for platforms:
+    //  1. With a native support for 64-bit integer instructions:
+    //    a) Pointers comparison through integers
+    //      %pti0 = ptrtoint i32 addrspace(4)* %ptr0 to i64
+    //      %pti1 = ptrtoint i32 addrspace(4)* %ptr1 to i64
+    //      %cmp = icmp eq i64 %pti0, %pti1
+    //    b) Regular pointers comparison
+    //      %cmp = icmp eq i32 addrspace(4)* %ptr0, i32 addrspace(4)* %ptr1
+    //
+    //  2. Without a native support for 64-bit integer instructions:
+    //    %ptp0 = call { i32, i32 } @llvm.genx.GenISA.ptr.to.pair.p4i32(i32 addrspace(4)* %ptr0)
+    //    %highAddr0 = extractvalue { i32, i32 } %ptp0, 1
+    //    %ptp1 = call { i32, i32 } @llvm.genx.GenISA.ptr.to.pair.p4i32(i32 addrspace(4)* %ptr1)
+    //    %highAddr1 = extractvalue { i32, i32 } %ptp1, 1
+    //    %cmp = icmp eq i32 %highAddr0, %highAddr1
+    bool CodeGenPatternMatch::MatchGenericPointersCmp(llvm::CmpInst& I)
+    {
+        using namespace llvm::PatternMatch;
+        struct GenericPointersCmpPattern : public Pattern
+        {
+            llvm::CmpInst* cmp;
+            SSource cmpSources[2];
+            uint8_t clearTagMask;
+            virtual void Emit(EmitPass* pass, const DstModifier& modifier)
+            {
+                pass->EmitGenericPointersCmp(cmp, cmpSources, modifier, clearTagMask);
+            }
+        };
+
+        auto hasGenericPtrTy = [](Value* V) {
+            Type* Ty = V->getType();
+            return isa<PointerType>(Ty) && Ty->getPointerAddressSpace() == ADDRESS_SPACE_GENERIC;
+        };
+
+        bool found = false;
+        uint8_t clearTagMask = 0;
+
+        if (m_ctx->m_hasEmu64BitInsts && m_Platform.hasNoFullI64Support())
+        {
+            // %ptp = call { i32, i32 } @llvm.genx.GenISA.ptr.to.pair.p4i32(i32 addrspace(4)* %48)
+            // %highAddr = extractvalue { i32, i32 } %ptp, 1
+            // %cmp = icmp eq i32 %highAddr, 0
+            for (uint8_t i = 0; i < 2; ++i)
+            {
+                Value* src = I.getOperand(i);
+                auto e = dyn_cast<ExtractValueInst>(src);
+
+                if (!e) continue;
+                if (e->getNumIndices() != 1) continue;
+
+                unsigned index = e->getIndices()[0];
+                static const unsigned HIGH_ADDR_INDEX = 1;
+
+                if (index != HIGH_ADDR_INDEX) continue;
+
+                if (GenIntrinsicInst* GII = dyn_cast<GenIntrinsicInst>(e->getAggregateOperand()))
+                {
+                    if (GII->getIntrinsicID() == GenISAIntrinsic::GenISA_ptr_to_pair)
+                    {
+                        Value* ptr = GII->getOperand(0);
+                        if (hasGenericPtrTy(ptr))
+                        {
+                            clearTagMask |= (!isa<ConstantPointerNull>(ptr) << i);
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            Value* src0 = I.getOperand(0);
+            Value* src1 = I.getOperand(1);
+
+            Value* ptr0 = nullptr;
+            Value* ptr1 = nullptr;
+
+            // %cmp = icmp eq i32 addrspace(4)* %2, addrspace(4)* %2
+            if (hasGenericPtrTy(src0) && hasGenericPtrTy(src1))
+            {
+                ptr0 = src0;
+                ptr1 = src1;
+                found = true;
+            }
+            // %pti0 = ptrtoint i32 addrspace(4)* %ptr0 to i64
+            // %pti1 = ptrtoint i32 addrspace(4)* %ptr1 to i64
+            // %cmp = icmp eq i64 %pti0, %pti1
+            else if (match(src0, m_PtrToInt(m_Value(ptr0))) &&
+                     match(src1, m_PtrToInt(m_Value(ptr1))))
+                found = (hasGenericPtrTy(ptr0) && hasGenericPtrTy(ptr1));
+
+            if (found)
+            {
+                clearTagMask |= (!isa<ConstantPointerNull>(ptr0) << 0);
+                clearTagMask |= (!isa<ConstantPointerNull>(ptr1) << 1);
+            }
+        }
+
+        if (found)
+        {
+            GenericPointersCmpPattern* pattern = new (m_allocator) GenericPointersCmpPattern();
+
+            bool supportsMod = SupportsModifier(&I);
+            pattern->cmpSources[0] = GetSource(I.getOperand(0), supportsMod, false);
+            pattern->cmpSources[1] = GetSource(I.getOperand(1), supportsMod, false);
+            pattern->cmp = &I;
+            pattern->clearTagMask = clearTagMask;
+
+            AddPattern(pattern);
+        }
+
+        return found;
+    }
+
     // We match this pattern
     // %1 = add %2 %3
     // %b = %cmp %1 0
@@ -4031,13 +4107,14 @@ namespace IGC
     {
         struct BoolOpPattern : public Pattern
         {
+            Pattern* cmpPattern;
             llvm::BinaryOperator* boolOp;
             llvm::CmpInst::Predicate predicate;
             SSource cmpSource[2];
             SSource binarySource;
             virtual void Emit(EmitPass* pass, const DstModifier& modifier)
             {
-                pass->CmpBoolOp(boolOp, predicate, cmpSource, binarySource, modifier);
+                pass->CmpBoolOp(cmpPattern, boolOp, predicate, cmpSource, binarySource, modifier);
             }
         };
 
@@ -4054,6 +4131,7 @@ namespace IGC
                     {
                         BoolOpPattern* pattern = new (m_allocator) BoolOpPattern();
                         bool supportsMod = SupportsModifier(cmp);
+                        pattern->cmpPattern = Match(*cmp);
                         pattern->boolOp = &I;
                         pattern->predicate = cmp->getPredicate();
                         pattern->cmpSource[0] = GetSource(cmp->getOperand(0), supportsMod, false);
@@ -5021,9 +5099,9 @@ namespace IGC
 
     bool CodeGenPatternMatch::MatchWaveShuffleIndex(llvm::GenIntrinsicInst& I)
     {
-        llvm::Value* helperLaneMode = I.getOperand(2);
+        auto helperLaneMode = cast<ConstantInt>(I.getOperand(2));
         IGC_ASSERT(helperLaneMode);
-        if (int_cast<int>(cast<ConstantInt>(helperLaneMode)->getSExtValue()) == 1)
+        if (int_cast<int>(helperLaneMode->getSExtValue()) == 1)
         {
             //only if helperLaneMode==1, we enable helper lane under some shuffleindex cases (not for all cases).
             HandleSubspanUse(I.getArgOperand(0));
@@ -5045,15 +5123,17 @@ namespace IGC
             helperLaneIndex = 1;
             break;
         case GenISAIntrinsic::GenISA_WaveClustered:
-        case GenISAIntrinsic::GenISA_WavePrefix:
             helperLaneIndex = 3;
+            break;
+        case GenISAIntrinsic::GenISA_WavePrefix:
+            helperLaneIndex = 4;
             break;
         default:
             IGC_ASSERT(false);
             break;
         }
-        llvm::Value* helperLaneMode = I.getArgOperand(helperLaneIndex);
-        if (int_cast<int>(cast<ConstantInt>(helperLaneMode)->getSExtValue()) == 1)
+        auto helperLaneMode = cast<ConstantInt>(I.getArgOperand(helperLaneIndex));
+        if (int_cast<int>(helperLaneMode->getSExtValue()) == 1)
         {
             m_NeedVMask = true;
         }

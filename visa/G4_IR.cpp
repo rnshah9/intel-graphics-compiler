@@ -223,6 +223,7 @@ G4_INST::G4_INST(
     G4_Operand* s1,
     G4_Operand* s2,
     G4_Operand* s3,
+    G4_Operand* s4,
     G4_InstOpts opt) :
     op(o), dst(d), predicate(prd), mod(m), option(opt),
     useInstList(irb.getAllocator()),
@@ -240,9 +241,9 @@ G4_INST::G4_INST(
     srcs[1] = s1;
     srcs[2] = s2;
     srcs[3] = s3;
+    srcs[4] = s4;
 
     dead = false;
-    skipPostRA = false;
     doPostRA = false;
     implAccSrc = nullptr;
     implAccDst = nullptr;
@@ -252,6 +253,7 @@ G4_INST::G4_INST(
     resetRightBound(s1);
     resetRightBound(s2);
     resetRightBound(s3);
+    resetRightBound(s4);
     computeRightBound(predicate);
     computeRightBound(mod);
 
@@ -260,6 +262,7 @@ G4_INST::G4_INST(
     associateOpndWithInst(s1, this);
     associateOpndWithInst(s2, this);
     associateOpndWithInst(s3, this);
+    associateOpndWithInst(s4, this);
     associateOpndWithInst(predicate, this);
     associateOpndWithInst(mod, this);
 }
@@ -298,6 +301,7 @@ G4_InstSend::G4_InstSend(
     setSrc(extDesc, 3);
     md->setExecSize(size);
 }
+
 
 void G4_INST::setOpcode(G4_opcode opcd)
 {
@@ -950,6 +954,11 @@ bool G4_INST::isMathPipeInst() const
         return true;
     }
 
+    if (isDFInstruction())
+    {
+        if (builder.getPlatform() == Xe_MTL)
+            return true;
+    }
 
     return false;
 }
@@ -2368,6 +2377,13 @@ bool G4_INST::canPropagateTo(
         }
     }
 
+    if ((useInst_op == G4_rol || useInst_op == G4_ror) && opndNum == 0 &&
+        (TypeSize(dstType) != TypeSize(srcType) || TypeSize(dstType) != TypeSize(useType)))
+    {
+        // rotation's src0 is sensitive to its type size. No prop if type sizes are different.
+        return false;
+    }
+
     // In general, to check whether that MOV could be propagated:
     //
     //  dst/T1 = src/T0;
@@ -2934,6 +2950,13 @@ bool G4_INST::canHoistTo(const G4_INST *defInst, bool simdBB) const
             // Disable it; otherwise shift's mode is changed illegally!
             return false;
         }
+    }
+
+    if ((defInst->opcode() == G4_rol || defInst->opcode() == G4_ror) &&
+        (TypeSize(defDstType) != TypeSize(srcType) || TypeSize(defDstType) != TypeSize(dstType)))
+    {
+        // rotate's dst is sensitive to its size. Make sure operand's size remains unchanged.
+        return false;
     }
 
     // Cannot do hoisting if the use inst has src modifier.
@@ -4080,7 +4103,7 @@ void G4_Areg::emit(std::ostream& output, bool symbolreg)
     case AREG_ACC0:    output << "acc0";  break;
     case AREG_ACC1:    output << "acc1";  break;
     case AREG_MASK0:   output << "ce0";   break;
-    case AREG_MS0:     output << "ms0";   break;
+    case AREG_MSG0:    output << "msg0";  break;
     case AREG_DBG:     output << "dbg0";  break;
     case AREG_SR0:     output << "sr0";   break;
     case AREG_CR0:     output << "cr0";   break;
@@ -5673,7 +5696,7 @@ PhyRegPool::PhyRegPool(Mem_Manager& m, unsigned int maxRegisterNumber)
     ARF_Table[AREG_ACC0]     = new (m) G4_Areg(AREG_ACC0);
     ARF_Table[AREG_ACC1]     = new (m) G4_Areg(AREG_ACC1);
     ARF_Table[AREG_MASK0]    = new (m) G4_Areg(AREG_MASK0);
-    ARF_Table[AREG_MS0]      = new (m) G4_Areg(AREG_MS0);
+    ARF_Table[AREG_MSG0]     = new (m) G4_Areg(AREG_MSG0);
     ARF_Table[AREG_DBG]      = new (m) G4_Areg(AREG_DBG);
     ARF_Table[AREG_SR0]      = new (m) G4_Areg(AREG_SR0);
     ARF_Table[AREG_CR0]      = new (m) G4_Areg(AREG_CR0);
@@ -6983,13 +7006,9 @@ void G4_Operand::updateFootPrint(BitSet& footprint, bool isSet, const IR_Builder
         // 2. Skip FLAG now because IGC might create a predicate var with
         //    8 elements, i.e., SETP (8), while the access granularity of FLAG
         //    is a word (16 bits)
-        // 3. Skip predefined var now as vISA user might not emit the correct
-        //    ArgSize attribute in some cases.
         if (isAreg())
             return true;
         if (isFlag())
-            return true;
-        if (getTopDcl() && getTopDcl()->isPreDefinedVar())
             return true;
         return lb <= rb && rb < footprint.getSize();
     };
@@ -7289,6 +7308,13 @@ unsigned int G4_Operand::getLinearizedEnd()
     return (getRightBound() - getLeftBound() + getLinearizedStart());
 }
 
+std::string G4_Operand::print() const
+{
+    std::stringstream ss;
+    ss << *const_cast<G4_Operand *>(this);
+    return ss.str();
+}
+
 void G4_Operand::dump() const
 {
 #if _DEBUG
@@ -7451,6 +7477,27 @@ bool G4_INST::canSupportSaturate() const
     return InstSupportsSaturationIGA(getPlatform(), *this, builder);
 }
 
+// Because that op with BF type dest will have different pre and post conds.
+// we won't allow it to carry conditional modifier
+bool G4_INST::isSamePrePostConds() const
+{
+     if (getDst()->getType() != Type_BF)
+     {
+         return true;
+     }
+     return false;
+     /* Even if all src and dest are BF, late pass will convert one of the src to f,
+      * so the following evaded the restriction.
+     for (int i = 0, numSrc = getNumSrc(); i < numSrc; ++i) {
+         if (getSrc(i)->getType() != Type_BF) {
+             return false;
+         }
+     }
+     return true;
+     */
+}
+
+
 bool G4_INST::canSupportCondMod() const
 {
     if (!builder.hasCondModForTernary() && getNumSrc() == 3)
@@ -7494,7 +7541,7 @@ bool G4_INST::canSupportCondMod() const
     }
 
     // ToDo: replace with IGA model
-    return ((op == G4_add) ||
+    return (((op == G4_add) ||
         (op == G4_and) ||
         (op == G4_addc) ||
         (op == G4_asr) ||
@@ -7526,7 +7573,7 @@ bool G4_INST::canSupportCondMod() const
         (op == G4_shl) ||
         (op == G4_shr) ||
         (op == G4_subb) ||
-        (op == G4_xor));
+        (op == G4_xor)) && isSamePrePostConds());
 }
 
 bool G4_INST::canSupportSrcModifier() const
@@ -7892,6 +7939,31 @@ bool G4_INST::supportsNullDst() const
         return false;
     }
     return getNumSrc() != 3 && !(op == G4_pln && !builder.doPlane());
+}
+
+void G4_INST::setAccurateDistType(SB_INST_PIPE depPipe)
+{
+    switch (depPipe)
+    {
+    case PIPE_INT:
+        setDistanceTypeXe(G4_INST::DistanceType::DISTINT);
+        break;
+    case PIPE_FLOAT:
+        setDistanceTypeXe(G4_INST::DistanceType::DISTFLOAT);
+        break;
+    case PIPE_LONG:
+        setDistanceTypeXe(G4_INST::DistanceType::DISTLONG);
+        break;
+    case PIPE_MATH:
+        setDistanceTypeXe(G4_INST::DistanceType::DISTMATH);
+        break;
+    case PIPE_SEND:
+        setDistanceTypeXe(G4_INST::DistanceType::DISTALL);
+        break;
+    default:
+        assert(0 && "Wrong ALU PIPE");
+        break;
+    }
 }
 
 bool G4_INST::isAlign1Ternary() const

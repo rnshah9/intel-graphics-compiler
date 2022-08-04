@@ -55,7 +55,6 @@ uint64_t GetImmediateVal(llvm::Value* Const);
 e_alignment GetPreferredAlignment(llvm::Value* Val, WIAnalysis* WIA, CodeGenContext* pContext);
 
 class CShaderProgram;
-class CBindlessShader;
 
 ///--------------------------------------------------------------------------------------------------------
 class CShader
@@ -221,6 +220,7 @@ public:
     CVariable* GetCR0();
     CVariable* GetCE0();
     CVariable* GetDBG();
+    CVariable* GetMSG0();
     CVariable* GetHWTID();
     CVariable* GetSP();
     CVariable* GetFP();
@@ -240,6 +240,8 @@ public:
     void InitializeStackVariables();
     void SaveStackState();
     void RestoreStackState();
+
+    void InitializeScratchSurfaceStateAddress();
 
     void        AllocateInput(CVariable* var, uint offset, uint instance = 0, bool forceLiveOut = false);
     void        AllocateOutput(CVariable* var, uint offset, uint instance = 0);
@@ -325,6 +327,13 @@ public:
     virtual bool HasFullDispatchMask() { return false; }
     bool needsEntryFence() const;
 
+    std::pair<bool, unsigned> getExtractMask(Value *V) const {
+        auto It = extractMasks.find(V);
+        if (It == extractMasks.end())
+            return std::make_pair(false, 0);
+        return std::make_pair(true, It->second);
+    }
+
     llvm::Function* entry;
     const CBTILayout* m_pBtiLayout;
     const CPlatform* m_Platform;
@@ -346,6 +355,8 @@ public:
     bool isMessageTargetDataCacheDataPort;
     uint m_sendStallCycle;
     uint m_staticCycle;
+    uint m_loopNestedStallCycle;
+    uint m_loopNestedCycle;
     unsigned m_spillSize = 0;
     float m_spillCost = 0;          // num weighted spill inst / total inst
 
@@ -355,6 +366,8 @@ public:
     /// is the value passed to VISA so that VISA's spill, if any,
     /// will go after this space.
     uint m_ScratchSpaceSize;
+
+    CVariable* m_ScratchSurfaceAddress = nullptr;
 
     ShaderStats* m_shaderStats;
 
@@ -560,6 +573,17 @@ public:
     bool IsIntelSymbolTableVoidProgram() const { return m_isIntelSymbolTableVoidProgram; }
     void SetIsIntelSymbolTableVoidProgram() { m_isIntelSymbolTableVoidProgram = true; }
 
+    ////////////////////////////////////////////////////////////////////
+    // NOTE: for vector load/stores instructions pass the
+    // optional instruction argument checks additional constraints
+    static Tristate shouldGenerateLSCQuery(
+        const CodeGenContext& Ctx,
+        llvm::Instruction* vectorLdStInst = nullptr,
+        SIMDMode Mode = SIMDMode::UNKNOWN);
+    bool shouldGenerateLSC(llvm::Instruction* vectorLdStInst = nullptr);
+    bool forceCacheCtrl(llvm::Instruction* vectorLdStInst = nullptr);
+    uint32_t totalBytesToStoreOrLoad(llvm::Instruction* vectorLdStInst);
+
 protected:
     bool CompileSIMDSizeInCommon(SIMDMode simdMode);
     uint32_t GetShaderThreadUsageRate();
@@ -631,6 +655,7 @@ protected:
     CVariable* m_SR0;
     CVariable* m_CR0;
     CVariable* m_CE0;
+    CVariable* m_MSG0;
     CVariable* m_DBG;
     CVariable* m_HW_TID;
     CVariable* m_SP;
@@ -703,14 +728,7 @@ public:
     CShader* GetShader(SIMDMode simd, ShaderDispatchMode mode = ShaderDispatchMode::NOT_APPLICABLE);
     void DeleteShader(SIMDMode simd, ShaderDispatchMode mode = ShaderDispatchMode::NOT_APPLICABLE);
     CodeGenContext* GetContext() { return m_context; }
-    void FillProgram(SVertexShaderKernelProgram* pKernelProgram);
-    void FillProgram(SHullShaderKernelProgram* pKernelProgram);
-    void FillProgram(SDomainShaderKernelProgram* pKernelProgram);
-    void FillProgram(SGeometryShaderKernelProgram* pKernelProgram);
-    void FillProgram(SPixelShaderKernelProgram* pKernelProgram);
-    void FillProgram(SComputeShaderKernelProgram* pKernelProgram);
-    void FillProgram(SOpenCLProgramInfo* pKernelProgram);
-    CBindlessShader* FillProgram(SBindlessProgram* pKernelProgram);
+
     ShaderStats* m_shaderStats;
 
 protected:

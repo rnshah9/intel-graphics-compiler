@@ -47,8 +47,10 @@ THE SOFTWARE.
 #include "common/LLVMWarningsPush.hpp"
 #include "llvm/Config/llvm-config.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/IRBuilder.h"
 #include "llvmWrapper/IR/DIBuilder.h"
+#include "llvmWrapper/IR/InstrTypes.h"
 #include "llvmWrapper/IR/Module.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include "llvmWrapper/Support/TypeSize.h"
@@ -2652,7 +2654,8 @@ SPIRVToLLVM::postProcessFunctionsReturnStruct(Function *F) {
           NewArgIt->setName(OldArgIt->getName());
           VMap[&*OldArgIt] = &*NewArgIt;
       }
-      IGCLLVM::CloneFunctionInto(NewF, F, VMap, true, Returns);
+      IGCLLVM::CloneFunctionInto(NewF, F, VMap,
+          IGCLLVM::CloneFunctionChangeType::DifferentModule, Returns);
       auto DL = M->getDataLayout();
       const auto ptrSize = DL.getPointerSize();
 
@@ -2726,8 +2729,8 @@ SPIRVToLLVM::postProcessFunctionsWithAggregateArguments(Function* F) {
       builder.CreateMemCpy(Alloca, I, size, ptrSize);
       if (T->isArrayTy()) {
         I = ptrSize > 4
-          ? builder.CreateConstInBoundsGEP2_64(Alloca, 0, 0)
-          : builder.CreateConstInBoundsGEP2_32(nullptr, Alloca, 0, 0);
+          ? builder.CreateConstInBoundsGEP2_64(T, Alloca, 0, 0)
+          : builder.CreateConstInBoundsGEP2_32(T, Alloca, 0, 0);
       } else if (T->isStructTy()) {
         I = Alloca;
       } else {
@@ -2972,7 +2975,7 @@ void transFunctionPointerCallArgumentAttributes(SPIRVValue *BV, CallInst *CI) {
     auto LlvmAttr = IsTypeAttrKind
             ? Attribute::get(CI->getContext(), LlvmAttrKind,
                              cast<PointerType>(CI->getOperand(ArgNo)->getType())
-                                 ->getElementType())
+                                 ->getPointerElementType())
             : Attribute::get(CI->getContext(), LlvmAttrKind);
     CI->addParamAttr(ArgNo, LlvmAttr);
   }
@@ -3455,7 +3458,7 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
             for (unsigned I = 0, E = CS->getNumOperands(); I != E; I++)
             {
                 auto *op = CS->getOperand(I);
-                auto *pGEP = IRB.CreateConstInBoundsGEP2_32(nullptr, pointer, 0, I);
+                auto *pGEP = IRB.CreateConstInBoundsGEP2_32(pointer->getType()->getPointerElementType(), pointer, 0, I);
                 if (auto *InnerCS = dyn_cast<ConstantStruct>(op))
                     LowerConstantStructStore(InnerCS, pGEP);
                 else
@@ -3803,7 +3806,7 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
     auto Call = CallInst::Create(
 #if LLVM_VERSION_MAJOR > 7
         llvm::cast<llvm::FunctionType>(
-            llvm::cast<llvm::PointerType>(func->getType())->getElementType()),
+            llvm::cast<llvm::PointerType>(func->getType())->getPointerElementType()),
 #endif
         func,
         transValue(BC->getArgumentValues(), F, BB),
@@ -4197,7 +4200,7 @@ SPIRVToLLVM::transFunction(SPIRVFunction *BF) {
      Attribute::AttrKind LLVMKind = SPIRSPIRVFuncParamAttrMap::rmap(Kind);
      Type *AttrTy = nullptr;
      if (LLVMKind == Attribute::AttrKind::ByVal)
-       AttrTy = cast<PointerType>(I->getType())->getElementType();
+       AttrTy = cast<PointerType>(I->getType())->getPointerElementType();
      else if (LLVMKind == Attribute::AttrKind::StructRet)
        AttrTy = I->getType();
      // Make sure to use a correct constructor for a typed/typeless attribute
@@ -4212,8 +4215,7 @@ SPIRVToLLVM::transFunction(SPIRVFunction *BF) {
   BF->foreachReturnValueAttr([&](SPIRVFuncParamAttrKind Kind){
     if (Kind == FunctionParameterAttributeCount)
       return;
-    F->addAttribute(AttributeList::ReturnIndex,
-        SPIRSPIRVFuncParamAttrMap::rmap(Kind));
+    IGCLLVM::addRetAttr(F, SPIRSPIRVFuncParamAttrMap::rmap(Kind));
   });
 
   // Creating all basic blocks before creating instructions.
@@ -4721,6 +4723,17 @@ SPIRVToLLVM::transKernelMetadata()
 
         if (F->getCallingConv() != CallingConv::SPIR_KERNEL || F->isDeclaration())
             continue;
+        // Kernel entry point wrappers and SPIR-V functions with actual kernel
+        // body resolve to the same LLVM functions. Only generate metadata upon
+        // encountering entry point wrappers, as SPIR-V stores all execution
+        // mode information at the entry point wrapper site.
+        // TODO: Instead, consider copying all SPIR-V function information from
+        // entry point wrappers to the actual SPIR-V funtions, and then
+        // erasing entry point wrappers as such from the SPIRVModule/
+        // SPIRVToLLVM classes. Preferably, such a rework should be done in the
+        // Khronos SPIR-V Translator and then downstreamed.
+        if (!isOpenCLKernel(BF))
+            continue;
         std::vector<llvm::Metadata*> KernelMD;
         KernelMD.push_back(ValueAsMetadata::get(F));
 
@@ -5053,7 +5066,7 @@ SPIRVToLLVM::transOCLBuiltinFromExtInst(SPIRVExtInst *BC, BasicBlock *BB) {
       BC->getName(),
       BB);
   setCallingConv(Call);
-  Call->addAttribute(AttributeList::FunctionIndex, Attribute::NoUnwind);
+  IGCLLVM::addFnAttr(Call, Attribute::NoUnwind);
   return Call;
 }
 

@@ -1658,7 +1658,7 @@ void LivenessAnalysis::hierarchicalIPA(const SparseBitSet& kernelInput, const Sp
     }
     for (auto subroutine : fg.sortedFuncTable)
     {
-        auto printVal = [&idToDecl](const BitSet& bs)
+        auto printVal = [&idToDecl](const SparseBitSet& bs)
         {
             for (int i = 0, size = (int)bs.getSize(); i < size; ++i)
             {
@@ -1674,14 +1674,14 @@ void LivenessAnalysis::hierarchicalIPA(const SparseBitSet& kernelInput, const Sp
         if (subroutine != fg.kernelInfo)
         {
             std::cerr << "\tArgs: ";
-            printVal(args[subroutine->getId()]);
+            printVal(args[subroutine]);
             std::cerr << "\n";
 
             std::cerr << "\tRetVal: ";
-            printVal(retVal[subroutine->getId()]);
+            printVal(retVal[subroutine]);
             std::cerr << "\n";
             std::cerr << "\tLiveThrough: ";
-            BitSet liveThrough = use_in[subroutine->getInitBB()->getId()];
+            SparseBitSet liveThrough = use_in[subroutine->getInitBB()->getId()];
             liveThrough &= use_out[subroutine->getExitBB()->getId()];
             printVal(liveThrough);
             //std::cerr << "\n";
@@ -1873,6 +1873,7 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
 
     std::map<unsigned, BitSet> footprints;
     std::vector<std::pair<G4_Declare*, INST_LIST_RITER>> pseudoKills;
+    std::map<G4_Declare*, INST_LIST_RITER> pseudoKillsForSpills;
 
     for (INST_LIST::reverse_iterator rit = bb->rbegin(), rend = bb->rend(); rit != rend; ++rit)
     {
@@ -2185,6 +2186,8 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
                 LocalLiveRange* topdclLR = nullptr;
 
                 if ((dstfootprint->isAllset() ||
+                    // Check whether the var is a spill and the inst does not write the whole region
+                    topdcl->getRegVar()->isRegVarTransient() ||
                     // Check whether local RA marked this range
                     (topdcl &&
                     (topdclLR = gra.getLocalLR(topdcl)) &&
@@ -2215,9 +2218,24 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
                     }
                     if (!foundKill)
                     {
-                        // All bytes of dst written at this point, so this is a good place to insert
-                        // pseudo kill inst
-                        pseudoKills.emplace_back(topdcl, rit);
+                        // If the original spill is coalesced, then its
+                        // corresponding pseudo kill would be erased in the
+                        // cleaning pass. On the other hand, if a kill for the
+                        // spill is found, the spill is not the candidate for
+                        // coalescing, and the existing kill will be good.
+                        if (topdcl->getRegVar()->isRegVarTransient())
+                        {
+                            // Here we keep tracking the most favorable
+                            // position, i.e., the topmost, to insert the
+                            // pseudo kill.
+                            pseudoKillsForSpills.insert_or_assign(topdcl, rit);
+                        }
+                        else
+                        {
+                            // All bytes of dst written at this point, so this is a good place to insert
+                            // pseudo kill inst
+                            pseudoKills.emplace_back(topdcl, rit);
+                        }
                     }
 
                     // Reset gen
@@ -2290,7 +2308,17 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
         {
             --iterToInsert;
         } while ((*iterToInsert)->isPseudoKill());
-        G4_INST* killInst = fg.builder->createPseudoKill(pseudoKill.first, PseudoKillType::FromLiveness);
+        G4_INST* killInst = fg.builder->createPseudoKill(pseudoKill.first, PseudoKillType::FromLiveness, false);
+        bb->insertBefore(iterToInsert, killInst);
+    }
+    for (auto pseudoKill : pseudoKillsForSpills)
+    {
+        INST_LIST_ITER iterToInsert = pseudoKill.second.base();
+        do
+        {
+            --iterToInsert;
+        } while ((*iterToInsert)->isPseudoKill());
+        G4_INST* killInst = fg.builder->createPseudoKill(pseudoKill.first, PseudoKillType::FromLiveness, false);
         bb->insertBefore(iterToInsert, killInst);
     }
 
@@ -2951,7 +2979,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
         for (auto inst : *bb)
         {
             G4_DstRegRegion* dst = inst->getDst();
-            if (dst != NULL &&
+            if (dst != nullptr &&
                 dst->getBase()->isRegAllocPartaker())
             {
                 MUST_BE_TRUE(dst->getBase()->asRegVar()->getPhyReg(), "RA verification error: No PREG assigned for variable " << GetTopDclFromRegRegion(dst)->getName() << "!");
@@ -2960,7 +2988,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
             for (unsigned j = 0; j < G4_MAX_SRCS; j++)
             {
                 G4_Operand* src = inst->getSrc(j);
-                if (src != NULL &&
+                if (src != nullptr &&
                     src->isSrcRegRegion() &&
                     src->asSrcRegRegion()->getBase()->isRegAllocPartaker())
                 {
@@ -3002,7 +3030,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             MUST_BE_TRUE(LiveInRegMapIt != LiveInRegMap.end(), "RA verification error: Invalid entry in LiveInRegMap!");
                             if (dcl->isInput())
                             {
-                                DEBUG_MSG("RA verification warning: Found conflicting input variables: " << dcl->getName()
+                                MUST_BE_TRUE(false, "RA verification warning: Found conflicting input variables: " << dcl->getName()
                                     << " and " << (*LiveInRegMapIt).second->getName() << " assigned to r" << regNum
                                     << "." << regOff << "!\n");
                                 liveInRegVec[idx] = varID;
@@ -3010,8 +3038,27 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             }
                             else
                             {
-                                DEBUG_MSG("RA verification warning: Found conflicting live-in variables: " << dcl->getName()
-                                    << " and " << LiveInRegMapIt->second->getName() << " assigned to r" <<
+                                // There's case that the 2 vars in outer scope are just live through the subroutine,
+                                // but IPA would mark 2 vars are live in the subroutine. So, here we report error only
+                                // if either var has the same scope id as the current BB. If any var is used in the
+                                // subroutine, we can still catch the conflict when verifying instructions later.
+                                //
+                                //     foo() {
+                                //         a = ...;
+                                //         bar();
+                                //         ... = a;
+                                //
+                                //         b = ...;
+                                //         bar();
+                                //         ... = b;
+                                //     }
+                                //     bar() {
+                                //         ...
+                                //     }
+                                MUST_BE_TRUE(bb->getScopeID() != dcl->getScopeID() &&
+                                    bb->getScopeID() != LiveInRegMapIt->second->getScopeID(),
+                                    "RA verification error: Found conflicting live-in variables: " << dcl->getName() <<
+                                    " and " << LiveInRegMapIt->second->getName() << " assigned to r" <<
                                     regNum << "." << regOff << "!\n");
                             }
 
@@ -3035,7 +3082,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
 
         for (G4_Declare* dcl : kernel.Declares)
         {
-            if (dcl->getAliasDeclare() != NULL)
+            if (dcl->getAliasDeclare() != nullptr)
                 continue;
             if (dcl->getRegVar()->isRegAllocPartaker())
             {
@@ -3058,7 +3105,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
                             if (dcl->isInput())
                             {
-                                DEBUG_MSG("RA verification warning: Found conflicting input variables: " << dcl->getName()
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting input variables: " << dcl->getName()
                                     << " and " << liveOutRegMapIt->second->getName() << " assigned to r" << regNum
                                     << "." << regOff << "!\n");
                                 liveOutRegVec[idx] = varID;
@@ -3066,9 +3113,13 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             }
                             else
                             {
-                                DEBUG_MSG("RA verification warning: Found conflicting live-out variables: " << dcl->getName()
-                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                    regNum << "." << regOff << "!\n");
+                                // Same as the case of live-in verification. Also report error only if either var has
+                                // the same scope id as the current BB.
+                                MUST_BE_TRUE(bb->getScopeID() != dcl->getScopeID() &&
+                                    bb->getScopeID() != liveOutRegMapIt->second->getScopeID(),
+                                    "RA verification error: Found conflicting live-out variables: " <<
+                                    dcl->getName() << " and " << liveOutRegMapIt->second->getName() <<
+                                    " assigned to r" << regNum << "." << regOff << "!\n");
                             }
 
                         }
@@ -3083,9 +3134,28 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
             }
         }
 
+        std::set<G4_Declare*> spillFillVariableOverwriteSet; // the collection is used to check if variables generated by spill/fill have been overwrite
         for (INST_LIST::reverse_iterator rit = bb->rbegin(); rit != bb->rend(); ++rit)
         {
             G4_INST* inst = (*rit);
+            // Skip the special case that is used to get the execution mask.
+            //
+            //     cmp.eq (M1, 16) P12 V0147(0,0)<0;1,0> V0147(0,0)<0;1,0>
+            //     cmp.eq (M5, 16) P12 V0147(0,0)<0;1,0> V0147(0,0)<0;1,0>
+            //
+            // FIXME: In the case, src0 and src1 are same and can be any
+            // register. In addition, the var might not be defined by vISA user
+            // resulting in imprecise liveness result. Some possible fix could
+            // be using the pre-defined var like R0, but it's not clear if the
+            // R0's live range would be affected a lot.
+            if (inst->opcode() == G4_cmp) {
+                const bool isModEq = inst->getCondMod() && inst->getCondMod()->getMod() == Mod_e;
+                const bool isNullDst = !inst->getDst() || inst->hasNULLDst();
+                const bool isSrc0SameAsSrc1 = inst->getSrc(0)->asSrcRegRegion() && inst->getSrc(1)->asSrcRegRegion() &&
+                    *inst->getSrc(0)->asSrcRegRegion() == *inst->getSrc(1)->asSrcRegRegion();
+                if (isModEq && isNullDst && isSrc0SameAsSrc1)
+                  continue;
+            }
             INST_LIST_RITER ritNext = rit;
             ritNext++;
             G4_INST* rNInst = nullptr;
@@ -3094,34 +3164,97 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                 rNInst = (*ritNext);
             }
 
-            if (inst->isPseudoKill())
-            {
-                continue;
-            }
             G4_DstRegRegion* dst = inst->getDst();
             G4_DstRegRegion* rNDst = nullptr;
-
+            G4_Declare* rNDcl = nullptr;
             if (rNInst && rNInst->isPseudoKill())
             {
                 rNDst = rNInst->getDst();
+                if (rNDst != nullptr)
+                {
+                    rNDcl = GetTopDclFromRegRegion(rNDst);
+                }
             }
 
-            //
             // verify dst operand
-            //
-            if (dst != NULL)
+            if (dst != nullptr)
             {
+                uint32_t varID = UINT_MAX;
+                G4_Declare* dcl = nullptr;
+
+                auto verifyDstRA = [&](uint32_t idx, uint32_t regNum, uint32_t regOff, bool& suppressWarning)
+                {
+                    liveOutRegMapIt = liveOutRegMap.find(idx);
+                    if (liveOutRegVec[idx] == UINT_MAX)
+                    {
+                        MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
+
+                        // Since we treat variables generated by spill/fill as whole region, here need special handling for fill->modify->spill case
+                        // that is to skip dst check if it has been written. Take below case as example, we should skip the dst(r13-r14) check of
+                        // the fill instruction since it has been written in mov instruction and has been removed from liveOutRegMap.
+                        //
+                        // (W) send(16)    r13.0<1>:ud r25 0xA 0x22c1019:ud // $236:; scratch read, resLen=2, msgLen=1
+                        //     mov(8)      r13.1 < 2 > :d  r10.1 < 2; 1, 0 > : d // $236:&400:
+                        // (W) sends(16)   null : ud r25 r13 0x8a : ud 0x20f1019 : ud // $236:; scratch write, resLen=2, msgLen=1, extMsgLen=2
+                        if (!suppressWarning &&
+                            !inst->isPseudoKill() &&
+                            !(dcl == rNDcl && rNInst->isPseudoKill()) &&
+                            spillFillVariableOverwriteSet.find(dcl) == spillFillVariableOverwriteSet.end())
+                        {
+                            // This warning is possible as some variables are defined without usage. TV5 is the example:
+                            // before RA:
+                            //     (W) send(8)  TV5(0,0)<1>:ud R0_Copy0(0,0) 0xA 0x219e0fe:ud // $130:&217:; memory fence, resLen=1, msgLen=1
+                            //     (W) and(8)   M7(0,0)<1>:ud  R0_Copy0(0,2)<0;1,0> : ud  0x7f000000 : ud // $131:&218:
+                            // after RA:
+                            //     (W) send(8)  r2.0<1>:ud r10 0xA 0x219e0fe:ud // $130:&217:; memory fence, resLen=1, msgLen=1
+                            //     (W) and(8)   r2.0<1>:ud  r10.2<0;1,0>:ud  0x7f000000 : ud // $131:&218:
+                            DEBUG_MSG("RA verification warning: Found unused variable " << dcl->getName() << ". Please double check!\n");
+                            suppressWarning = true;
+                        }
+                    }
+                    else
+                    {
+                        MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
+                        if (liveOutRegVec[idx] != varID)
+                        {
+                            const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
+
+                            if (strstr(dcl->getName(), GlobalRA::StackCallStr) != nullptr)
+                            {
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting stackCall variable: " << dcl->getName()
+                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                    regNum << "." << regOff << "!\n");
+                            }
+                            else if (indr_use.isSet(liveOutRegVec[idx]) == true)
+                            {
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting indirect variables: " << dcl->getName()
+                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                    regNum << "." << regOff << "!\n");
+                            }
+                            else
+                            {
+                                if (!inst->isPseudoKill())
+                                {
+                                    MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
+                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                        regNum << "." << regOff << "!\n");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            liveOutRegVec[idx] = UINT_MAX;
+                            liveOutRegMap.erase(liveOutRegMapIt);
+                        }
+                    }
+                };
+
                 if (dst->getBase()->isRegAllocPartaker())
                 {
                     G4_DstRegRegion* dstrgn = dst;
                     G4_RegVar* var = dstrgn->getBase()->asRegVar();
-                    uint32_t varID = var->getId();
-                    G4_Declare* dcl = GetTopDclFromRegRegion(dstrgn);
-                    G4_Declare* rNDcl = nullptr;
-                    if (rNDst != nullptr)
-                    {
-                        rNDcl = GetTopDclFromRegRegion(rNDst);
-                    }
+                    varID = var->getId();
+                    dcl = GetTopDclFromRegRegion(dstrgn);
                     MUST_BE_TRUE(dcl != nullptr, "Null declare found");
                     var = dcl->getRegVar();
 
@@ -3130,56 +3263,34 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
 
                     uint32_t regNum = var->getPhyReg()->asGreg()->getRegNum();
                     uint32_t regOff = var->getPhyRegOff();
+                    bool suppressWarning = false; // used to suppress warning per word since each operand crosses multiple words
 
-                    uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
-                        (regOff * dcl->getElemSize()) / G4_WSIZE;
-                    for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
+                    // For spill/fill variable, should check whole region size
+                    if (var->isRegVarTransient())
                     {
-                        liveOutRegMapIt = liveOutRegMap.find(idx);
-                        if (liveOutRegVec[idx] == UINT_MAX)
+                        uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
+                            (regOff * dcl->getElemSize()) / G4_WSIZE;
+
+                        for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
                         {
-                            if (!inst->isPseudoKill())
-                            {
-                                MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                                DEBUG_MSG("RA verification warning: Found unused variable " << dcl->getName() << "!\n");
-                            }
+                            verifyDstRA(idx, regNum, regOff, suppressWarning);
                         }
-                        else
+
+                        if (spillFillVariableOverwriteSet.find(dcl) == spillFillVariableOverwriteSet.end())
                         {
-                            MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                            if (liveOutRegVec[idx] != varID)
-                            {
-                                const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
+                            spillFillVariableOverwriteSet.insert(dcl);
+                        }
+                    }
+                    // For non spill/fill variables, should check operand size
+                    else
+                    {
+                        auto dstLB = dst->getLinearizedStart();
+                        auto dstRB = dst->getLinearizedEnd();
 
-                                if (strstr(dcl->getName(), GlobalRA::StackCallStr) != NULL)
-                                {
-                                    DEBUG_MSG("RA verification warning: Found conflicting stackCall variable: " << dcl->getName()
-                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                        regNum << "." << regOff << "!\n");
-                                }
-                                else if (indr_use.isSet(liveOutRegVec[idx]) == true)
-                                {
-                                    MUST_BE_TRUE(false, "RA verification warning: Found conflicting indirect variables: " << dcl->getName()
-                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                        regNum << "." << regOff << "!\n");
-                                }
-                                else
-                                {
-                                    if (!inst->isPseudoKill())
-                                    {
-                                        DEBUG_MSG("RA verification error: Found conflicting variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                }
-                            }
-
-                            if (liveAnalysis.writeWholeRegion(bb, inst, dstrgn, kernel.getOptions()) ||
-                                inst->isPseudoKill() || rNDcl == dcl) {
-                                liveOutRegVec[idx] = UINT_MAX;
-                                MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                                liveOutRegMap.erase(liveOutRegMapIt);
-                            }
+                        for (unsigned int dstOffset = dstLB; dstOffset <= dstRB; dstOffset += G4_WSIZE)
+                        {
+                            uint32_t idx = dstOffset / G4_WSIZE;
+                            verifyDstRA(idx, regNum, regOff, suppressWarning);
                         }
                     }
                 }
@@ -3187,13 +3298,13 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                 {
                     G4_DstRegRegion* dstrgn = dst;
                     G4_Declare* addrdcl = GetTopDclFromRegRegion(dstrgn);
-                    G4_RegVar* ptvar = NULL;
+                    G4_RegVar* ptvar = nullptr;
                     int vid = 0;
 
-                    while ((ptvar = pointsToAnalysis.getPointsTo(addrdcl->getRegVar(), vid++)) != NULL)
+                    while ((ptvar = pointsToAnalysis.getPointsTo(addrdcl->getRegVar(), vid++)) != nullptr)
                     {
-                        uint32_t varID = ptvar->getId();
-                        G4_Declare* dcl = ptvar->getDeclare();
+                        varID = ptvar->getId();
+                        dcl = ptvar->getDeclare();
                         MUST_BE_TRUE(dcl != nullptr, "Null declare found");
                         while (dcl->getAliasDeclare())
                         {
@@ -3206,43 +3317,18 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
 
                         uint32_t regNum = var->getPhyReg()->asGreg()->getRegNum();
                         uint32_t regOff = var->getPhyRegOff();
+                        auto dstLB = regNum * kernel.numEltPerGRF<Type_UB>() + regOff * TypeSize(dcl->getElemType());
+                        auto dstRB = dstLB + dcl->getByteSize() - 1;
+                        uint32_t idx = dstLB / G4_WSIZE;
 
-                        uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
-                            (regOff * dcl->getElemSize()) / G4_WSIZE;
-                        for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
+                        bool suppressWarning = false;
+                        for (unsigned int dstOffset = dstLB; dstOffset <= dstRB; dstOffset += std::max((unsigned int)dst->getExecTypeSize(), (unsigned int)G4_WSIZE))
                         {
-                            liveOutRegMapIt = liveOutRegMap.find(idx);
-                            if (liveOutRegVec[idx] == UINT_MAX)
+                            for (unsigned int elementOffset = 0; elementOffset < dst->getElemSize(); elementOffset += G4_WSIZE)
                             {
-                                MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                                DEBUG_MSG("RA verification warning: Found unused variable " << dcl->getName() << "!\n");
-                            }
-                            else
-                            {
-                                MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                                if (liveOutRegVec[idx] != varID)
-                                {
-                                    const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
+                                idx = (dstOffset + elementOffset) / G4_WSIZE;
 
-                                    if (strstr(dcl->getName(), GlobalRA::StackCallStr) != NULL)
-                                    {
-                                        DEBUG_MSG("RA verification warning: Found conflicting stackCall variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                    else if (indr_use.isSet(liveOutRegVec[idx]) == true)
-                                    {
-                                        MUST_BE_TRUE(false, "RA verification warning: Found conflicting indirect variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                    else
-                                    {
-                                        MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                }
+                                verifyDstRA(idx, regNum, regOff, suppressWarning);
                             }
                         }
                     }
@@ -3251,7 +3337,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
 
             if (inst->opcode() == G4_pseudo_fcall)
             {
-                if (ret != NULL && ret->getRegVar() != NULL)
+                if (ret != nullptr && ret->getRegVar() != nullptr)
                 {
                     G4_RegVar* var = ret->getRegVar();
                     uint32_t varID = var->getId();
@@ -3274,96 +3360,83 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                 }
             }
 
-            //
             // verify each source operand
-            //
             for (unsigned j = 0; j < G4_MAX_SRCS; j++)
             {
                 G4_Operand* src = inst->getSrc(j);
-                if (src == NULL)
+                if (src == nullptr)
                 {
                     continue;
                 }
-                if (src->isAddrExp() && src->asAddrExp()->isRegAllocPartaker())
+
+                uint32_t varID = UINT_MAX;
+                G4_Declare* dcl = nullptr;
+                auto verifySrcRA = [&](uint32_t idx, uint32_t regNum, uint32_t regOff)
                 {
-                    G4_RegVar* var = src->asAddrExp()->getRegVar();
-                    uint32_t varID = UINT_MAX;
-                    G4_Declare* dcl = NULL;
-
-                    varID = var->getId();
-                    dcl = var->getDeclare();
-
-                    uint32_t regNum = var->getPhyReg()->asGreg()->getRegNum();
-                    uint32_t regOff = var->getPhyRegOff();
-
-                    uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
-                        (regOff * dcl->getElemSize()) / G4_WSIZE;
-                    for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
+                    liveOutRegMapIt = liveOutRegMap.find(idx);
+                    if (liveOutRegVec[idx] == UINT_MAX)
                     {
-                        liveOutRegMapIt = liveOutRegMap.find(idx);
-                        if (liveOutRegVec[idx] == UINT_MAX)
+                        liveOutRegVec[idx] = varID;
+                        MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
+                        liveOutRegMap.emplace(idx, dcl);
+                    }
+                    else
+                    {
+                        if (liveOutRegVec[idx] != varID)
                         {
-                            liveOutRegVec[idx] = varID;
-                            MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                            liveOutRegMap.emplace(idx, dcl);
-                        }
-                        else
-                        {
-                            if (liveOutRegVec[idx] != varID)
-                            {
-                                const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
+                            const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
 
-                                if (dcl->isInput())
+                            if (dcl->isInput())
+                            {
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting input variables: " << dcl->getName()
+                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" << regNum
+                                    << "." << regOff << "!\n");
+                                liveOutRegVec[idx] = varID;
+                                liveOutRegMapIt->second = dcl;
+                            }
+                            else if (strstr(dcl->getName(), GlobalRA::StackCallStr) != nullptr)
+                            {
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting stackCall variables: " << dcl->getName()
+                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                    regNum << "." << regOff << "!\n");
+                            }
+                            else if (indr_use.isSet(liveOutRegVec[idx]) == true)
+                            {
+                                MUST_BE_TRUE(false, "RA verification error: Found conflicting indirect variables: " << dcl->getName()
+                                    << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                    regNum << "." << regOff << "!\n");
+                            }
+                            else
+                            {
+                                INST_LIST::reverse_iterator succ = rit;
+                                ++succ;
+                                bool idMismatch = false;
+                                G4_Declare* topdcl = GetTopDclFromRegRegion((*succ)->getDst());
+                                if (topdcl != nullptr &&
+                                    liveOutRegVec[idx] != topdcl->getRegVar()->getId())
                                 {
-                                    DEBUG_MSG("RA verification warning: Found conflicting input variables: " << dcl->getName()
-                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" << regNum
-                                        << "." << regOff << "!\n");
-                                    liveOutRegVec[idx] = varID;
-                                    liveOutRegMapIt->second = dcl;
+                                    idMismatch = true;
                                 }
-                                else if (strstr(dcl->getName(), GlobalRA::StackCallStr) != NULL)
+                                if (succ == bb->rbegin() ||
+                                    !(*succ)->isPseudoKill() ||
+                                    (*succ)->getDst() == nullptr ||
+                                    idMismatch)
                                 {
-                                    DEBUG_MSG("RA verification warning: Found conflicting stackCall variables: " << dcl->getName()
+                                    MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
                                         << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
                                         regNum << "." << regOff << "!\n");
-                                }
-                                else if (indr_use.isSet(liveOutRegVec[idx]) == true)
-                                {
-                                    MUST_BE_TRUE(false, "RA verification warning: Found conflicting indirect variables: " << dcl->getName()
-                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                        regNum << "." << regOff << "!\n");
-                                }
-                                else
-                                {
-                                    INST_LIST::reverse_iterator succ = rit;
-                                    ++succ;
-                                    bool idMismatch = false;
-                                    G4_Declare* topdcl = GetTopDclFromRegRegion((*succ)->getDst());
-                                    if (topdcl != nullptr &&
-                                        liveOutRegVec[idx] != topdcl->getRegVar()->getId())
-                                    {
-                                        idMismatch = true;
-                                    }
-                                    if (succ == bb->rend() ||
-                                        !(*succ)->isPseudoKill()  ||
-                                        (*succ)->getDst() == NULL ||
-                                        idMismatch)
-                                    {
-                                        MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
                                 }
                             }
                         }
                     }
-                }
-                else if (src->isSrcRegRegion() && src->asSrcRegRegion()->getBase()->isRegAllocPartaker())
+                };
+
+                if (src->isSrcRegRegion() && src->asSrcRegRegion()->getBase()->isRegAllocPartaker())
                 {
                     G4_SrcRegRegion* srcrgn = src->asSrcRegRegion();
                     G4_RegVar* var = srcrgn->getBase()->asRegVar();
-                    uint32_t varID = var->getId();
-                    G4_Declare* dcl = GetTopDclFromRegRegion(srcrgn);
+                    varID = var->getId();
+                    dcl = GetTopDclFromRegRegion(srcrgn);
                     var = dcl->getRegVar();
                     MUST_BE_TRUE(var->getId() == varID, "RA verification error: Invalid regVar ID!");
                     MUST_BE_TRUE(var->getPhyReg()->isGreg(), "RA verification error: Invalid dst reg!");
@@ -3373,65 +3446,25 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                         uint32_t regNum = var->getPhyReg()->asGreg()->getRegNum();
                         uint32_t regOff = var->getPhyRegOff();
 
-                        uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
-                            (regOff * dcl->getElemSize()) / G4_WSIZE;
-                        for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
+                        // For spill/fill variable, should check whole region size
+                        if (var->isRegVarTransient())
                         {
-                            liveOutRegMapIt = liveOutRegMap.find(idx);
-                            if (liveOutRegVec[idx] == UINT_MAX)
+                            uint32_t idx = regNum * kernel.numEltPerGRF<Type_UW>() +
+                                (regOff * dcl->getElemSize()) / G4_WSIZE;
+                            for (uint32_t i = 0; i < dcl->getWordSize(); ++i, ++idx)
                             {
-                                liveOutRegVec[idx] = varID;
-                                MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                                liveOutRegMap.emplace(idx, dcl);
+                                verifySrcRA(idx, regNum, regOff);
                             }
-                            else
+                        }
+                        // For non spill/fill variables, should check operand size
+                        else
+                        {
+                            auto srcLB = src->getLinearizedStart();
+                            auto srcRB = src->getLinearizedEnd();
+                            for (unsigned int srcOffset = srcLB; srcOffset <= srcRB; srcOffset += G4_WSIZE)
                             {
-                                if (liveOutRegVec[idx] != varID)
-                                {
-                                    const SparseBitSet& indr_use = liveAnalysis.indr_use[bb->getId()];
-
-                                    if (dcl->isInput())
-                                    {
-                                        DEBUG_MSG("RA verification warning: Found conflicting input variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" << regNum
-                                            << "." << regOff << "!\n");
-                                        liveOutRegVec[idx] = varID;
-                                        liveOutRegMapIt->second = dcl;
-                                    }
-                                    else if (strstr(dcl->getName(), GlobalRA::StackCallStr) != NULL)
-                                    {
-                                        DEBUG_MSG("RA verification warning: Found conflicting stackCall variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                    else if (indr_use.isSet(liveOutRegVec[idx]) == true)
-                                    {
-                                        MUST_BE_TRUE(false, "RA verification warning: Found conflicting indirect variables: " << dcl->getName()
-                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                            regNum << "." << regOff << "!\n");
-                                    }
-                                    else
-                                    {
-                                        INST_LIST::reverse_iterator succ = rit;
-                                        ++succ;
-                                        bool idMismatch = false;
-                                        G4_Declare* topdcl = GetTopDclFromRegRegion((*succ)->getDst());
-                                        if (topdcl != nullptr &&
-                                            liveOutRegVec[idx] != topdcl->getRegVar()->getId())
-                                        {
-                                            idMismatch = true;
-                                        }
-                                        if (succ == bb->rbegin() ||
-                                            !(*succ)->isPseudoKill() ||
-                                            (*succ)->getDst() == NULL ||
-                                            idMismatch)
-                                        {
-                                            DEBUG_MSG("RA verification error: Found conflicting variables: " << dcl->getName()
-                                                << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                                regNum << "." << regOff << "!\n");
-                                        }
-                                    }
-                                }
+                                unsigned idx = srcOffset / G4_WSIZE;
+                                verifySrcRA(idx, regNum, regOff);
                             }
                         }
                     }
@@ -3467,13 +3500,13 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                 {
                     G4_SrcRegRegion* srcrgn = src->asSrcRegRegion();
                     G4_Declare* addrdcl = GetTopDclFromRegRegion(srcrgn);
-                    G4_RegVar* ptvar = NULL;
+                    G4_RegVar* ptvar = nullptr;
                     int vid = 0;
 
-                    while ((ptvar = pointsToAnalysis.getPointsTo(addrdcl->getRegVar(), vid++)) != NULL)
+                    while ((ptvar = pointsToAnalysis.getPointsTo(addrdcl->getRegVar(), vid++)) != nullptr)
                     {
-                        uint32_t varID = ptvar->getId();
-                        G4_Declare* dcl = ptvar->getDeclare()->getRootDeclare();
+                        varID = ptvar->getId();
+                        dcl = ptvar->getDeclare()->getRootDeclare();
                         G4_RegVar* var = dcl->getRegVar();
 
                         uint32_t regNum = var->getPhyReg()->asGreg()->getRegNum();
@@ -3498,7 +3531,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
 
                                     if (dcl->isInput())
                                     {
-                                        DEBUG_MSG("RA verification warning: Found conflicting input variables: " << dcl->getName()
+                                        MUST_BE_TRUE(false, "RA verification error: Found conflicting input variables: " << dcl->getName()
                                             << " and " << liveOutRegMapIt->second->getName() << " assigned to r" << regNum
                                             << "." << regOff << "!\n");
                                         liveOutRegVec[idx] = varID;
@@ -3506,7 +3539,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                                     }
                                     else if (indr_use.isSet(liveOutRegVec[idx]) == true)
                                     {
-                                        MUST_BE_TRUE(false, "RA verification warning: Found conflicting indirect variables: " << dcl->getName()
+                                        MUST_BE_TRUE(false, "RA verification error: Found conflicting indirect variables: " << dcl->getName()
                                             << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
                                             regNum << "." << regOff << "!\n");
                                     }
@@ -3669,7 +3702,7 @@ int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
     gra.assignLocForReturnAddr();
 
     //FIXME: here is a temp WA
-    bool hybridWithSpill = builder.getOption(vISA_HybridRAWithSpill) && !(kernel.fg.getHasStackCalls() || kernel.fg.getIsStackCallFunc());
+    bool hybridWithSpill = builder.getOption(vISA_HybridRAWithSpill) && (!(kernel.fg.getHasStackCalls() || kernel.fg.getIsStackCallFunc()) || builder.getOption(vISA_PartitionWithFastHybridRA));
     if (kernel.fg.funcInfoTable.size() > 0 &&
         kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D && !hybridWithSpill)
     {
@@ -3735,6 +3768,9 @@ int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
         LivenessAnalysis liveAnalysis(gra,
             G4_GRF | G4_INPUT, true);
         liveAnalysis.computeLiveness();
+        // Mark scope so that verifier can leverage the scope information to
+        // verify live-in and live-out.
+        kernel.fg.markScope();
         gra.verifyRA(liveAnalysis);
     }
 
@@ -3742,7 +3778,6 @@ int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
     for (auto inst : gra.getEUFusionCallWAInsts())
     {
         kernel.setMaskOffset(inst, InstOpt_M16);
-        // inst->dump();
     }
 
 #if defined(_DEBUG)
