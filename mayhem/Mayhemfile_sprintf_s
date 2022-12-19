@@ -1,0 +1,6 @@
+project: intel-graphics-compiler
+target: /sprintf-s
+
+cmds:
+  - cmd: /fuzz_sprintf_s
+    libfuzzer: true

@@ -59,7 +59,8 @@ jobs:
       fail-fast: false
       matrix:
         mayhemfile:
-          - mayhem/Mayhemfile
+          - mayhem/Mayhemfile_sprintf_s
+          - mayhem/Mayhemfile_linux_resource_linker
 
     steps:
       - uses: actions/checkout@v3
